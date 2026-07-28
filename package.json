@@ -1,0 +1,58 @@
+{
+  "name": "@cat.in.dev/catops-cli",
+  "version": "0.0.1",
+  "description": "Framework CLI para pipelines DevOps (shell, docker, git, kubectl, helm, npm, terraform, ansible, argocd, tekton, oc, az) sobre un ExecutionContext compartido, con menus interactivos y selectores automaticos por flag. Escrito en TypeScript, 100% usable desde JavaScript.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "catops-cli": "./dist/bin/catops-cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "cli",
+    "devops",
+    "docker",
+    "kubernetes",
+    "kubectl",
+    "helm",
+    "git",
+    "terraform",
+    "ansible",
+    "argocd",
+    "tekton",
+    "pipeline",
+    "ci-cd",
+    "typescript"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean",
+    "example": "npm run build && node examples/pipeline-example.js",
+    "start": "node dist/bin/catops-cli.js",
+    "pretest": "npm run build",
+    "test": "node --test",
+    "prepublishOnly": "npm run build && npm test",
+    "prepare": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  },
+  "license": "MIT"
+}
