@@ -31,7 +31,8 @@ class Shell {
         retry: 1,
         retryDelay: 1000,
         timeout: 0,
-        dryRun: false
+        dryRun: false,
+        shell: false
     };
 
     configure(options: ExecOptions = {}): this {
@@ -83,7 +84,7 @@ class Shell {
                 {
                     cwd: this.cwdPath,
                     env: this.environment,
-                    shell: false,
+                    shell: options.shell,
                     stdio: ["inherit", "pipe", "pipe"]
                 }
             );

@@ -45,14 +45,14 @@ export interface HttpSenderOptions {
     method?: string;
     headers?: Record<string, string>;
     /** Transforma el evento antes de enviarlo. Por defecto se manda tal cual. */
-    formatBody?: (event: NotificationEvent) => unknown;
+    formatBody?: (event: NotificationEvent) => Promise<unknown> | unknown;
 }
 
 export function http({ url, method = "POST", headers = {}, formatBody }: HttpSenderOptions): Sender {
 
     return async (event: NotificationEvent) => {
 
-        const body = formatBody ? formatBody(event) : event;
+        const body = formatBody ? await formatBody(event) : event;
 
         const response = await fetch(url, {
             method,
@@ -80,7 +80,7 @@ export interface WebhookSenderOptions {
     url: string;
     headers?: Record<string, string>;
     /** Formatea el payload del webhook. Por defecto: { text: event.message }. */
-    format?: (event: NotificationEvent) => unknown;
+    format?: (event: NotificationEvent) => Promise<unknown> | unknown;
 }
 
 export function webhook({ url, headers, format }: WebhookSenderOptions): Sender {

@@ -1,4 +1,4 @@
-# catops-cli
+# devops-cli
 
 Framework interno para pipelines DevOps, empaquetado como librería npm instalable en cualquier proyecto.
 
@@ -7,47 +7,47 @@ Framework interno para pipelines DevOps, empaquetado como librería npm instalab
 **Opción A — publicado en tu registro npm (público o privado tipo Verdaccio/Artifactory/GitHub Packages):**
 
 ```bash
-npm install catops-cli
-# o si lo publicas con scope propio, p.ej. @miorg/catops-cli
-npm install @miorg/catops-cli
+npm install devops-cli
+# o si lo publicas con scope propio, p.ej. @miorg/devops-cli
+npm install @miorg/devops-cli
 ```
 
 **Opción B — sin publicar, directo desde este proyecto (útil mientras lo maduras):**
 
 ```bash
-# Dentro del repo de catops-cli
-npm pack               # genera catops-cli-0.1.0.tgz
+# Dentro del repo de devops-cli
+npm pack               # genera devops-cli-0.1.0.tgz
 
 # Dentro del proyecto que lo va a consumir
-npm install /ruta/a/catops-cli-0.1.0.tgz
+npm install /ruta/a/devops-cli-0.1.0.tgz
 ```
 
 **Opción C — enlazado local con `npm link` (para desarrollar la librería y el proyecto que la consume al mismo tiempo):**
 
 ```bash
-# Dentro del repo de catops-cli
+# Dentro del repo de devops-cli
 npm link
 
 # Dentro del proyecto consumidor
-npm link catops-cli
+npm link devops-cli
 ```
 
 **Opción D — como dependencia de Git (monorepo o repo privado, sin registro npm):**
 
 ```bash
-npm install git+https://github.com/tu-org/catops-cli.git
+npm install git+https://github.com/tu-org/devops-cli.git
 ```
 
 Cualquiera de las 4 deja disponibles dos cosas en el proyecto consumidor:
 
-1. La librería: `const { Context, Menu, services } = require("catops-cli");`
-2. El binario: `npx catops-cli` (o `catops-cli` si lo instalaste global con `-g`).
+1. La librería: `const { Context, Menu, services } = require("devops-cli");`
+2. El binario: `npx devops-cli` (o `devops-cli` si lo instalaste global con `-g`).
 
 ## Publicar una nueva versión
 
 ```bash
 npm version patch   # o minor / major
-npm publish         # agrega --access public si usas un scope (@miorg/catops-cli)
+npm publish         # agrega --access public si usas un scope (@miorg/devops-cli)
 ```
 
 ## Piezas que integra
@@ -108,7 +108,7 @@ ctx.services.docker.build(...)
 
 ## Uso dentro de un proyecto que lo instaló
 
-Crea un `devops.pipeline.js` (o `devops.config.js` / `.catops-cli.js`) en la raíz de tu proyecto:
+Crea un `devops.pipeline.js` (o `devops.config.js` / `.devops-cli.js`) en la raíz de tu proyecto:
 
 ```javascript
 // devops.pipeline.js
@@ -131,10 +131,10 @@ module.exports = (ctx) => ({
 Y ejecuta:
 
 ```bash
-npx catops-cli --debug --env=prod
+npx devops-cli --debug --env=prod
 ```
 
-`catops-cli` detecta el archivo, arma el `Context` a partir de los flags/params de `argv`, y renderiza el menú.
+`devops-cli` detecta el archivo, arma el `Context` a partir de los flags/params de `argv`, y renderiza el menú.
 
 ## Uso como librería (sin el menú interactivo)
 
@@ -193,8 +193,8 @@ ctx.services.shell.configure({ retry: 3, timeout: 30000 });
 Y `Context.parseArgv()` ya conecta flags de línea de comandos automáticamente:
 
 ```bash
-npx catops-cli --dry-run             # activa dryRun global
-npx catops-cli --retry=3 --timeout=15000
+npx devops-cli --dry-run             # activa dryRun global
+npx devops-cli --retry=3 --timeout=15000
 ```
 
 ## Logging commands de Azure Pipelines (`ctx.services.azdo`)
@@ -260,7 +260,7 @@ options: {
 `ctx.notifier` clasifica cada error (con la función que le des) y lo manda a los `senders` que hayas registrado para esa área:
 
 ```javascript
-const { classifiers, senders } = require("catops-cli");
+const { classifiers, senders } = require("devops-cli");
 
 // 1. ¿A qué área de TI pertenece este error?
 ctx.notifier.classify(classifiers.byCommand({
@@ -285,7 +285,7 @@ ctx.notifier.classify(classifiers.byPattern([
 // 2. ¿A dónde se manda cada área?
 ctx.notifier.channel("kubernetes", senders.webhook({ url: process.env.SLACK_K8S_WEBHOOK }));
 ctx.notifier.channel("security", senders.http({ url: "https://security.miempresa.com/incidents" }));
-ctx.notifier.channel("*", senders.file({ path: "./catops-cli-errors.log" })); // TODO error, sin importar el área
+ctx.notifier.channel("*", senders.file({ path: "./devops-cli-errors.log" })); // TODO error, sin importar el área
 
 // 3. (opcional) éxito, sin clasificación de área
 ctx.notifier.onSuccess(senders.log());
@@ -305,6 +305,82 @@ A partir de aquí, cualquier `ctx.run(...)` o item de menú con `action` reporta
 
 Puedes escribir tu propio sender: es cualquier función `(event) => void | Promise<void>` — recibe `{ type, taskId, area?, error?, result?, message, timestamp }`.
 
+## kubectl / oc: kubeconfig, namespace y espera cíclica del rollout
+
+`kubectl` y `oc` ahora aceptan `{ kubeconfig, namespace }` como último argumento en **todos** sus comandos (compatible con las llamadas de antes, que siguen funcionando sin ese argumento):
+
+```javascript
+await ctx.services.kubectl.apply("deploy.yaml", { kubeconfig: "/etc/kube/prod.yaml", namespace: "prod" });
+await ctx.services.kubectl.get("pods", "-o", "wide", { namespace: "staging" });
+
+await ctx.services.oc.login({ server: "https://api.cluster:6443", token, namespace: "prod" });
+await ctx.services.oc.apply("deploy.yaml", { namespace: "prod" });
+```
+
+### `waitForDeployment` — validación cíclica del rollout
+
+Sondea el Deployment (o `DeploymentConfig` con `oc`) hasta que:
+
+- llega a **estado exitoso** (réplicas listas/actualizadas == deseadas) → resuelve con `{ status: "success", ... }`,
+- se queda en **estado Failed** más de `failedGracePeriod` sin recuperarse → lanza `DeploymentRolloutError`,
+- supera **`maxRestarts`** reinicios acumulados entre todos sus pods → lanza `DeploymentRolloutError` de inmediato, sin esperar el grace period,
+- o se cumple el **`timeout`** global sin éxito → lanza `DeploymentRolloutError`.
+
+En los tres casos de fallo, el polling se detiene ("se mata el proceso") y el error se re-lanza — listo para que `ctx.run(...)` lo capture y lo reporte automáticamente vía `ctx.notifier` (el error ya trae `command: "kubectl"` / `command: "oc"`, así que `classifiers.byCommand({ kubectl: "kubernetes" })` lo clasifica sin configuración extra).
+
+```javascript
+const { classifiers } = require("devops-cli");
+
+ctx.notifier.classify(classifiers.byCommand({ kubectl: "kubernetes", oc: "kubernetes" }));
+ctx.notifier.channel("kubernetes", senders.webhook({ url: process.env.SLACK_K8S_WEBHOOK }));
+
+await ctx.run("deploy-api", async () => {
+    await ctx.services.kubectl.apply("deployment.yaml", { namespace: "prod" });
+
+    return ctx.services.kubectl.waitForDeployment({
+        deployment: "api",
+        namespace: "prod",
+        timeout: 5 * 60 * 1000,      // 5 min totales antes de abortar
+        pollInterval: 5000,           // chequea cada 5s
+        failedGracePeriod: 30_000,    // si entra en Failed, espera 30s a que se recupere
+        maxRestarts: 5                // si supera 5 reinicios acumulados, aborta ya
+    });
+});
+```
+
+Con `oc`, usa `resourceType: "dc"` para apuntar a un `DeploymentConfig` clásico de OpenShift en vez de un `Deployment` nativo (default: `"deployment"`).
+
+### `waitForDeploymentGroup` — validar todas las instancias de un mismo despliegue GitOps
+
+Pensada para el caso de GitOps donde un mismo repo termina desplegado como **varios Deployments** (una instancia por región/config/cliente, etc.), todos marcados con un label común, por ejemplo:
+
+```yaml
+metadata:
+  labels:
+    deployment-group: repository-14
+```
+
+`waitForDeploymentGroup` descubre todas las instancias que compartan ese label y corre `waitForDeployment` sobre **cada una en paralelo**, con el mismo `timeout`/`pollInterval`/`failedGracePeriod`/`maxRestarts` para todas:
+
+```javascript
+await ctx.run("deploy-repo-14", () =>
+    ctx.services.kubectl.waitForDeploymentGroup({
+        label: { "deployment-group": "repository-14" }, // o el string ya armado: "deployment-group=repository-14"
+        namespace: "prod",
+        timeout: 5 * 60 * 1000,
+        pollInterval: 5000,
+        failedGracePeriod: 30_000,
+        maxRestarts: 5
+    })
+);
+```
+
+- Si **todas** llegan a estado exitoso → resuelve con `{ status: "success", deployments: [...] }` (el detalle de cada una).
+- Si **alguna falla** (timeout individual, Failed sin recuperarse, o maxRestarts) → espera a que las demás terminen, y lanza `DeploymentGroupRolloutError` con `succeeded` (nombres que sí llegaron) y `failed` (nombres + motivo de cada una que no llegó).
+- Si el label **no matchea ningún deployment**, también lanza `DeploymentGroupRolloutError` (grupo vacío = error, no éxito silencioso).
+
+Igual que con `waitForDeployment`, el error lleva `command: "kubectl"` / `command: "oc"`, así que se clasifica solo con `classifiers.byCommand(...)` si usas el `notifier`. Con `oc`, también acepta `resourceType: "dc"` para agrupar `DeploymentConfig`s.
+
 ## Tests
 
 ```bash
@@ -315,7 +391,7 @@ Corre sobre `node:test` (sin dependencias externas): valida el `Context`, el mot
 
 ## Siguientes pasos posibles
 
-- Publicar en un registro privado (Verdaccio/Artifactory/GitHub Packages) para instalarlo con scope, p.ej. `@miorg/catops-cli`.
+- Publicar en un registro privado (Verdaccio/Artifactory/GitHub Packages) para instalarlo con scope, p.ej. `@miorg/devops-cli`.
 - Agregar tipos (`.d.ts`) si el equipo usa TypeScript.
 - Agregar más plugins (`ansible-lint`, `trivy`, `sonar-scanner`) con el mismo patrón.
 - CI propio (GitHub Actions/Azure Pipelines) que corra `npm test` en cada PR antes de `npm publish`.

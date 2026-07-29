@@ -104,7 +104,7 @@ export class Menu {
                 await ctx.notifier.reportError(label, error, ctx);
 
                 logger.error(errorMessage(error));
-
+                ctx.params.catch === "throw" && process.exit(1);
             }
 
             return;

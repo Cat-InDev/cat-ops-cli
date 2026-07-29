@@ -24,6 +24,8 @@ export interface ExecOptions {
     timeout?: number;
     /** Si es true, solo loguea el comando y no lo ejecuta. Default: false */
     dryRun?: boolean;
+    /** Si se quiere ejecutar comandos en el shell del sistema directamente. Default: false */
+    shell?: boolean;
 }
 
 // ---------------------------------------------------------------------------
