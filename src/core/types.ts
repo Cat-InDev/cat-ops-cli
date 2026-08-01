@@ -131,3 +131,12 @@ export interface ResolvedMenuEntry {
     onSuccess?: SuccessCallback;
     onError?: ErrorCallback;
 }
+
+/**
+ * Igual que ErrorClassifier, pero en vez de decidir el área, devuelve el
+ * mensaje humano que se va a reportar (reemplazando el stderr/mensaje crudo
+ * del error). Devuelve `undefined` si no sabe describir ese error (se
+ * prueba el siguiente formatter registrado, y si ninguno matchea se usa el
+ * mensaje crudo del error como antes).
+ */
+export type ErrorMessageFormatter = (error: unknown, ctx: Context) => string | undefined;

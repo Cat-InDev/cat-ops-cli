@@ -14,6 +14,7 @@ export type { ServicesRegistry } from "./services";
 export { Notifier } from "./core/Notifier";
 export * as senders from "./core/senders";
 export * as classifiers from "./core/classifiers";
+export * as messages from "./core/messages";
 
 export type {
     ExecOptions,
@@ -28,5 +29,6 @@ export type {
     ErrorCallback,
     NotificationEvent,
     ErrorClassifier,
+    ErrorMessageFormatter,
     Sender
 } from "./core/types";

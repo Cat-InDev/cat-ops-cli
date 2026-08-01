@@ -291,6 +291,21 @@ ctx.notifier.channel("*", senders.file({ path: "./devops-cli-errors.log" })); //
 ctx.notifier.onSuccess(senders.log());
 ```
 
+Tambien se pueden incluir parsers de error para convertir y usar errores amigables con las areas receptoras
+
+```
+const { classifiers, messages } = require("devops-cli");
+
+ctx.notifier.classify(classifiers.byCommand({ docker: "containers" }));
+
+ctx.notifier.describeError(messages.byPattern([
+    [/500 Internal Server Error/, "Se ha reportado a infraestructura: falta de espacio en el registry"],
+    [/unauthorized|403/i, "Credenciales inválidas contra el registry, revisa el secret"]
+]));
+
+ctx.notifier.channel("containers", senders.webhook({ url: TEAMS_WEBHOOK }));
+```
+
 A partir de aquí, cualquier `ctx.run(...)` o item de menú con `action` reporta automáticamente al notifier — no hay que llamarlo a mano en cada task.
 
 ### Senders incluidos

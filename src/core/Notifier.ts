@@ -1,5 +1,5 @@
 import type { Context } from "./Context";
-import type { ErrorClassifier, NotificationEvent, Sender } from "./types";
+import type { ErrorClassifier, ErrorMessageFormatter, NotificationEvent, Sender } from "./types";
 
 const WILDCARD = "*";
 
@@ -26,6 +26,7 @@ function toMessage(error: unknown): string {
 export class Notifier {
 
     private classifiers: ErrorClassifier[] = [];
+    private messageFormatters: ErrorMessageFormatter[] = [];
     private channels: Map<string, Sender[]> = new Map();
     private successSenders: Sender[] = [];
     private defaultArea = "unclassified";
@@ -38,6 +39,23 @@ export class Notifier {
      */
     classify(classifier: ErrorClassifier): this {
         this.classifiers.push(classifier);
+        return this;
+    }
+
+    /**
+     * Registra una función que, dado el error, devuelve el mensaje
+     * personalizado a reportar (reemplaza el stderr/mensaje crudo). Se
+     * prueban en orden; gana la primera que devuelva un string. Si ninguna
+     * matchea, se usa el mensaje crudo del error (stderr/Error.message).
+     *
+     * Ejemplo:
+     *   notifier.describeError(messages.byPattern([
+     *       [/500 Internal Server Error/, "Se reportó a infraestructura: falta de espacio en el registry"],
+     *       [/unauthorized|403/, "Credenciales inválidas contra el registry, revisa el secret"]
+     *   ]));
+     */
+    describeError(formatter: ErrorMessageFormatter): this {
+        this.messageFormatters.push(formatter);
         return this;
     }
 
@@ -77,6 +95,20 @@ export class Notifier {
 
     }
 
+    private resolveMessage(error: unknown, ctx: Context): string {
+
+        for (const formatter of this.messageFormatters) {
+
+            const message = formatter(error, ctx);
+
+            if (message) return message;
+
+        }
+
+        return toMessage(error);
+
+    }
+
     async reportSuccess(taskId: string, result: unknown, ctx: Context): Promise<void> {
 
         if (!this.successSenders.length) return;
@@ -109,7 +141,7 @@ export class Notifier {
             taskId,
             area,
             error,
-            message: toMessage(error),
+            message: this.resolveMessage(error, ctx),
             timestamp: new Date().toISOString()
         };
 
