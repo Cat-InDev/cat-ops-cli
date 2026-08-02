@@ -1,6 +1,15 @@
 # devops-cli
 
-Framework interno para pipelines DevOps, empaquetado como librería npm instalable en cualquier proyecto.
+Framework para pipelines DevOps, escrito en **TypeScript** (100% usable desde JavaScript puro), empaquetado como librería npm instalable en cualquier proyecto.
+
+Trae:
+
+- Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
+- **14 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`).
+- **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
+- **retry / timeout / dryRun** en cada comando de shell.
+- Validación cíclica de rollouts de Kubernetes/OpenShift (`waitForDeployment`, `waitForDeploymentGroup`).
+- **Callbacks de éxito/error por tarea** + un sistema de **notificaciones clasificadas por área de TI**, con mensajes personalizables y senders (`log`, `file`, `http`, `webhook`, `websocket`).
 
 ## Instalación
 
@@ -16,10 +25,10 @@ npm install @miorg/devops-cli
 
 ```bash
 # Dentro del repo de devops-cli
-npm pack               # genera devops-cli-0.1.0.tgz
+npm pack               # genera devops-cli-<version>.tgz
 
 # Dentro del proyecto que lo va a consumir
-npm install /ruta/a/devops-cli-0.1.0.tgz
+npm install /ruta/a/devops-cli-<version>.tgz
 ```
 
 **Opción C — enlazado local con `npm link` (para desarrollar la librería y el proyecto que la consume al mismo tiempo):**
@@ -40,7 +49,13 @@ npm install git+https://github.com/tu-org/devops-cli.git
 
 Cualquiera de las 4 deja disponibles dos cosas en el proyecto consumidor:
 
-1. La librería: `const { Context, Menu, services } = require("devops-cli");`
+1. La librería, tanto desde TS como desde JS puro:
+   ```typescript
+   import { Context, Menu, services, type MenuDefinition } from "devops-cli";
+   ```
+   ```javascript
+   const { Context, Menu, services } = require("devops-cli");
+   ```
 2. El binario: `npx devops-cli` (o `devops-cli` si lo instalaste global con `-g`).
 
 ## Publicar una nueva versión
@@ -50,63 +65,41 @@ npm version patch   # o minor / major
 npm publish         # agrega --access public si usas un scope (@miorg/devops-cli)
 ```
 
-## Piezas que integra
+`prepublishOnly` corre el build y los tests automáticamente antes de publicar.
 
-Une dos piezas que ya tenías:
+## TypeScript
 
-1. El **ExecutionContext** (estado global: flags, params, env, vars, results, logger, prompt).
-2. Los **servicios de shell** (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`), integrados **tal cual** los diste, sin reescribir su lógica.
-
-La única pieza nueva es el pegamento: `ctx.services` apunta directamente a los módulos de `src/services`, así que cualquier task puede hacer `ctx.services.docker.build(...)` sin recibir nada por parámetro, tal como describías.
-
-## Estructura
+Todo `src/` está escrito en TypeScript, con `strict: true`. `npm run build` compila a `dist/` (JS + `.d.ts` + source maps por archivo) — eso es lo único que se publica (ver `files` en `package.json`).
 
 ```
 src/
   core/
-    Context.js    -> ExecutionContext singleton (Context.current())
-    Menu.js        -> Renderer/Menu.render() para navegación jerárquica
-    prompt.js       -> ctx.ask / ctx.confirm / ctx.select (sin dependencias externas)
-    logger.js       -> logger usado por Context y por shell.js
+    Context.ts       -> ExecutionContext singleton (Context.current() / Context.parseArgv())
+    Menu.ts           -> Menu.render() con navegación anidada + selección automática por flag
+    Notifier.ts       -> clasificación de errores por área + canales + senders
+    classifiers.ts    -> fábricas de ErrorClassifier: byCommand, byPattern
+    messages.ts        -> fábricas de ErrorMessageFormatter: byPattern, byCommand, byRule
+    senders.ts          -> fábricas de Sender: log, file, http, webhook, websocket
+    prompt.ts            -> ctx.ask / ctx.confirm / ctx.select (sin dependencias externas)
+    logger.ts             -> logger usado por Context y por shell.ts
+    types.ts               -> tipos compartidos (MenuDefinition, ExecOptions, NotificationEvent, ...)
   services/
-    shell.js        -> motor base (spawn), con retry/timeout/dryRun
-    docker.js       -> tal cual el original
-    git.js          -> tal cual el original
-    kubectl.js      -> tal cual el original
-    helm.js         -> tal cual el original
-    npm.js          -> tal cual el original
-    archive.js      -> tal cual el original
-    terraform.js    -> init/plan/apply/destroy/output/validate/fmt
-    ansible.js      -> playbook/adhoc/vaultEncrypt/vaultDecrypt/galaxyInstall
-    argocd.js       -> login/appSync/appGet/appWait/appSet/appList/appRollback
-    tekton.js       -> pipelineStart/pipelinerunList/pipelinerunLogs/taskStart/taskrunLogs
-    oc.js           -> login/project/apply/get/rollout/newApp/startBuild/logs
-    az.js           -> loginServicePrincipal/acrBuild/webappDeploy/aksGetCredentials/...
-    azdo.js         -> logging commands de Azure Pipelines (##vso)
-    index.js        -> registra todos los servicios anteriores
-  index.js          -> exporta { Context, Menu, logger, prompt, services }
+    shell.ts          -> motor base (spawn), con retry/timeout/dryRun
+    docker.ts, git.ts, kubectl.ts, helm.ts, npm.ts, archive.ts
+    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts, az.ts, azdo.ts
+    index.ts           -> registra todos los servicios anteriores (ServicesRegistry)
+  index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, tipos
+  bin/
+    devops-cli.ts      -> CLI ejecutable (busca devops.pipeline.js en el proyecto consumidor)
 examples/
-  pipeline-example.js -> pipeline + menú de ejemplo
+  pipeline-example.js  -> pipeline + menú + notificaciones de ejemplo, corre contra dist/
 test/
-  context.test.js     -> Context, flags, vars, parseArgv, dryRun global
-  shell.test.js       -> retry, timeout, dryRun del motor shell.exec
-  services.test.js    -> verifica que docker/terraform/argocd arman bien los args
+  context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
+  notifier.test.js, senders.test.js, hooks-integration.test.js,
+  kubectl.test.js, oc.test.js, deployment-group.test.js
 ```
 
-## Qué se corrigió para que "convivan"
-
-- `shell.js` usaba `logger.info(...)` / `logger.error(...)` sin importarlo. Se agregó `const logger = require("../core/logger")`.
-- `Context.js` hacía `this.logger = logger` sin importar `logger` tampoco. Ahora importa `./logger`.
-- Se agregó `this.services = services` dentro del constructor de `Context`, cableando exactamente el "Registry" que proponías al final de tu mensaje:
-
-```javascript
-ctx.services.git.clone(...)
-ctx.services.docker.build(...)
-```
-
-- `Context.instance` pasó de crearse en la definición de la clase a crearse de forma perezosa en `Context.current()`, para evitar problemas de orden de carga con los `require` circulares entre `Context` → `services` → `shell` → `logger`.
-
-## Uso dentro de un proyecto que lo instaló
+## Uso rápido: menú con `devops.pipeline.js` + el bin
 
 Crea un `devops.pipeline.js` (o `devops.config.js` / `.devops-cli.js`) en la raíz de tu proyecto:
 
@@ -116,19 +109,14 @@ module.exports = (ctx) => ({
     title: "Pipeline",
     options: {
         Build: async () => {
-            await ctx.services.docker.build({
-                image: "registry/app:v1",
-                dockerfile: "Dockerfile"
-            });
+            await ctx.services.docker.build({ image: "registry/app:v1", dockerfile: "Dockerfile" });
         },
         Deploy: async () => {
-            await ctx.services.kubectl.apply("deployment.yaml");
+            await ctx.services.kubectl.apply("deployment.yaml", { namespace: "prod" });
         }
     }
 });
 ```
-
-Y ejecuta:
 
 ```bash
 npx devops-cli --debug --env=prod
@@ -136,14 +124,38 @@ npx devops-cli --debug --env=prod
 
 `devops-cli` detecta el archivo, arma el `Context` a partir de los flags/params de `argv`, y renderiza el menú.
 
-## Uso como librería (sin el menú interactivo)
+## Uso directo en tu propio script (p. ej. con `tsx`)
 
-```bash
-npm run example -- --debug --env=prod
+```typescript
+// src/index.ts
+import { Context, Menu, type MenuDefinition } from "devops-cli";
+
+const ctx = Context.parseArgv();
+
+const mainMenu: MenuDefinition = {
+    title: "Pipeline",
+    "flag-selector": "--menu-selector",
+    options: {
+        Build: { selector: "build", action: () => ctx.services.docker.build({ image: "app:v1" }) }
+    }
+};
+
+Menu.render(mainMenu, ctx);
 ```
 
+```json
+{ "scripts": { "dev": "tsx src/index.ts" } }
+```
+
+```bash
+npx tsx src/index.ts --menu-selector=build
+npm run dev -- --menu-selector=build     # con npm hace falta el "--" para reenviar flags
+```
+
+## Uso como librería sin menú (pipeline lineal)
+
 ```javascript
-const { Context, Menu } = require("./src");
+const { Context } = require("devops-cli"); // o require("./dist") dentro de este repo
 
 const ctx = Context.parseArgv(); // llena flags/params desde argv
 
@@ -153,83 +165,74 @@ await ctx.services.git.checkout("develop");
 await ctx.services.npm.ci();
 await ctx.services.docker.build({ image: ctx.get("image"), dockerfile: "Dockerfile" });
 await ctx.services.docker.push(ctx.get("image"));
-await ctx.services.kubectl.apply("deployment.yaml");
+await ctx.services.kubectl.apply("deployment.yaml", { namespace: "prod" });
 ```
 
-O con menús interactivos anidados:
+## Menús: definición, anidamiento y selectores automáticos por flag
+
+Un `MenuDefinition` es `{ title, options }`, donde cada entrada de `options` puede ser:
+
+- una **función** — task directa: `Build: () => {...}`
+- otro **`MenuDefinition`** — submenú directo: `Docker: dockerMenu`
+- un **objeto largo** — para poder darle `selector`, `onSuccess`/`onError`, o envolver un submenú:
+  ```javascript
+  Build: { selector: "build", action: () => {...}, onSuccess: (r, ctx) => {...}, onError: (e, ctx) => {...} }
+  Docker: { selector: "docker", menu: dockerMenu }
+  // también podés inlinear el submenú directo con su propio selector al lado:
+  Docker: { selector: "docker", title: "Docker", "flag-selector": "--docker-action", options: {...} }
+  ```
+
+### Selección automática por flag
+
+Cualquier `MenuDefinition` puede declarar `"flag-selector": "--algun-flag"`. Si el `Context` trae un param que matchea el `selector` de alguno de sus items, esa opción se ejecuta **automáticamente, sin ningún prompt**:
 
 ```javascript
-await Menu.render({
-    title: "Deploy",
+const dockerMenu = {
+    title: "Docker",
+    "flag-selector": "--docker-action",
     options: {
-        Build: buildTask,
-        Docker: dockerMenu,   // submenú anidado
-        Publish: publishTask
+        Build: { selector: "build", action: buildTask },
+        Push: { selector: "push", action: pushTask }
     }
-});
+};
+
+const mainMenu = {
+    title: "Pipeline",
+    "flag-selector": "--menu-selector",
+    options: {
+        Docker: { selector: "docker", menu: dockerMenu },
+        Deploy: { selector: "deploy", action: deployTask }
+    }
+};
+
+Menu.render(mainMenu, ctx);
 ```
-
-## retry / timeout / dryRun en shell.exec
-
-`shell.exec(command, ...args)` sigue aceptando exactamente los mismos argumentos que antes (por eso `docker.js`, `git.js`, etc. no necesitaron cambiar). Ahora, si el último argumento es un objeto plano, se interpreta como opciones **solo para esa llamada**:
-
-```javascript
-await ctx.services.docker.push(image); // igual que siempre
-
-await ctx.services.shell.exec("curl", "https://flaky-api.internal", {
-    retry: 3,        // reintentos totales (default: 1 = sin retry)
-    retryDelay: 1000,// ms entre reintentos
-    timeout: 5000,   // ms antes de matar el proceso con SIGTERM
-    dryRun: true      // solo loguea el comando, no lo ejecuta
-});
-```
-
-También puedes fijar defaults globales para todo el proceso:
-
-```javascript
-ctx.services.shell.configure({ retry: 3, timeout: 30000 });
-```
-
-Y `Context.parseArgv()` ya conecta flags de línea de comandos automáticamente:
 
 ```bash
-npx devops-cli --dry-run             # activa dryRun global
-npx devops-cli --retry=3 --timeout=15000
+# encadena ambos niveles en un solo comando, sin ningún prompt interactivo:
+devops-cli --menu-selector=docker --docker-action=build
+
+# un solo nivel:
+devops-cli --menu-selector=deploy
+
+# sin flags -> menú interactivo normal
+devops-cli
 ```
 
-## Logging commands de Azure Pipelines (`ctx.services.azdo`)
+Si el valor del flag no matchea ningún `selector` del nivel actual, cae de vuelta al menú interactivo (con un warning), en vez de fallar en seco. Cada submenú revisa su **propio** `flag-selector` de forma independiente, así que podés automatizar tantos niveles como quieras encadenando flags.
+
+### Callbacks de éxito/error por item
 
 ```javascript
-ctx.services.azdo.setVariable("BUILD_TAG", "v1.2.3");
-ctx.services.azdo.logWarning("El caché de npm no se encontró, se reconstruye desde cero.");
-ctx.services.azdo.group("Build");
-// ... pasos ...
-ctx.services.azdo.endGroup();
+Deploy: {
+    selector: "deploy",
+    action: () => ctx.services.kubectl.apply("deployment.yaml"),
+    onSuccess: (result, ctx) => ctx.logger.success("Deploy OK"),
+    onError: (error, ctx) => ctx.logger.error(`Deploy falló: ${error.message}`)
+}
 ```
 
-## Servicios de infraestructura ya integrados
-
-```javascript
-await ctx.services.terraform.plan({ varFile: "prod.tfvars" });
-await ctx.services.terraform.apply();
-
-await ctx.services.ansible.playbook("site.yml", { inventory: "hosts.ini" });
-
-await ctx.services.argocd.appSync("mi-app", { prune: true });
-
-await ctx.services.tekton.pipelineStart("build-pipeline", { params: { image: "app:v1" } });
-
-await ctx.services.oc.login({ server: "https://api.cluster:6443", token: process.env.OC_TOKEN });
-await ctx.services.oc.rollout("mi-app");
-
-await ctx.services.az.acrBuild({ registry: "miregistro", image: "app:v1" });
-```
-
-## Callbacks de éxito/error por tarea + notificaciones por área de TI
-
-Cada tarea (`ctx.run()` o un item de menú) puede llevar sus propios callbacks, y además reporta automáticamente al `notifier` global del `Context`.
-
-### Callbacks por tarea
+Mismo patrón con `ctx.run()` fuera de un menú:
 
 ```javascript
 await ctx.run(
@@ -242,87 +245,54 @@ await ctx.run(
 );
 ```
 
-En un menú, los mismos campos van directo en el item:
+En ambos casos, además de tus callbacks, el resultado se reporta automáticamente al `ctx.notifier` (ver más abajo) — no hay que llamarlo a mano.
+
+## retry / timeout / dryRun en shell.exec
+
+`shell.exec(command, ...args)` sigue aceptando exactamente los mismos argumentos de siempre. Si el último argumento es un objeto plano, se interpreta como opciones **solo para esa llamada**:
 
 ```javascript
-options: {
-    Deploy: {
-        selector: "deploy",
-        action: () => ctx.services.kubectl.apply("deployment.yaml"),
-        onSuccess: (result, ctx) => {...},
-        onError: (error, ctx) => {...}
-    }
-}
+await ctx.services.docker.push(image); // igual que siempre
+
+await ctx.services.shell.exec("curl", "https://flaky-api.internal", {
+    retry: 3,         // reintentos totales (default: 1 = sin retry)
+    retryDelay: 1000, // ms entre reintentos
+    timeout: 5000,    // ms antes de matar el proceso con SIGTERM
+    dryRun: true       // solo loguea el comando, no lo ejecuta
+});
 ```
 
-### Clasificar el error por área de TI y enrutarlo a canales
-
-`ctx.notifier` clasifica cada error (con la función que le des) y lo manda a los `senders` que hayas registrado para esa área:
+Defaults globales para todo el proceso:
 
 ```javascript
-const { classifiers, senders } = require("devops-cli");
-
-// 1. ¿A qué área de TI pertenece este error?
-ctx.notifier.classify(classifiers.byCommand({
-    docker: "containers",
-    kubectl: "kubernetes",
-    oc: "kubernetes",
-    terraform: "infra",
-    ansible: "infra",
-    git: "scm",
-    argocd: "cd-pipeline",
-    tkn: "cd-pipeline",
-    az: "cloud-azure"
-}));
-
-// también puedes clasificar por el texto del error:
-ctx.notifier.classify(classifiers.byPattern([
-    [/permission denied|unauthorized/i, "security"],
-    [/timeout|ECONNREFUSED/i, "networking"],
-    [/no space left|ENOSPC/i, "infra"]
-]));
-
-// 2. ¿A dónde se manda cada área?
-ctx.notifier.channel("kubernetes", senders.webhook({ url: process.env.SLACK_K8S_WEBHOOK }));
-ctx.notifier.channel("security", senders.http({ url: "https://security.miempresa.com/incidents" }));
-ctx.notifier.channel("*", senders.file({ path: "./devops-cli-errors.log" })); // TODO error, sin importar el área
-
-// 3. (opcional) éxito, sin clasificación de área
-ctx.notifier.onSuccess(senders.log());
+ctx.services.shell.configure({ retry: 3, timeout: 30000 });
 ```
 
-Tambien se pueden incluir parsers de error para convertir y usar errores amigables con las areas receptoras
+`Context.parseArgv()` ya conecta flags de línea de comandos automáticamente:
 
-```
-const { classifiers, messages } = require("devops-cli");
-
-ctx.notifier.classify(classifiers.byCommand({ docker: "containers" }));
-
-ctx.notifier.describeError(messages.byPattern([
-    [/500 Internal Server Error/, "Se ha reportado a infraestructura: falta de espacio en el registry"],
-    [/unauthorized|403/i, "Credenciales inválidas contra el registry, revisa el secret"]
-]));
-
-ctx.notifier.channel("containers", senders.webhook({ url: TEAMS_WEBHOOK }));
+```bash
+npx devops-cli --dry-run             # activa dryRun global
+npx devops-cli --retry=3 --timeout=15000
 ```
 
-A partir de aquí, cualquier `ctx.run(...)` o item de menú con `action` reporta automáticamente al notifier — no hay que llamarlo a mano en cada task.
+## Servicios de infraestructura incluidos
 
-### Senders incluidos
+```javascript
+await ctx.services.terraform.plan({ varFile: "prod.tfvars" });
+await ctx.services.terraform.apply();
 
-| Sender | Uso |
-|---|---|
-| `senders.log()` | Usa el logger interno (consola) |
-| `senders.file({ path })` | Agrega el evento como una línea JSON al archivo |
-| `senders.http({ url, method?, headers?, formatBody? })` | `POST` genérico del evento como JSON |
-| `senders.webhook({ url, format? })` | Como `http`, pero formatea `{ text: "❌ ..." }` por defecto (Slack/Teams/Discord-friendly) |
-| `senders.websocket({ url, timeout? })` | Abre una conexión WS, manda el evento como JSON y cierra. Requiere Node ≥21 (usa el `WebSocket` global) |
+await ctx.services.ansible.playbook("site.yml", { inventory: "hosts.ini" });
 
-Puedes escribir tu propio sender: es cualquier función `(event) => void | Promise<void>` — recibe `{ type, taskId, area?, error?, result?, message, timestamp }`.
+await ctx.services.argocd.appSync("mi-app", { prune: true });
+
+await ctx.services.tekton.pipelineStart("build-pipeline", { params: { image: "app:v1" } });
+
+await ctx.services.az.acrBuild({ registry: "miregistro", image: "app:v1" });
+```
 
 ## kubectl / oc: kubeconfig, namespace y espera cíclica del rollout
 
-`kubectl` y `oc` ahora aceptan `{ kubeconfig, namespace }` como último argumento en **todos** sus comandos (compatible con las llamadas de antes, que siguen funcionando sin ese argumento):
+`kubectl` y `oc` aceptan `{ kubeconfig, namespace }` como último argumento en **todos** sus comandos (retrocompatible, sigue funcionando sin ese argumento):
 
 ```javascript
 await ctx.services.kubectl.apply("deploy.yaml", { kubeconfig: "/etc/kube/prod.yaml", namespace: "prod" });
@@ -334,21 +304,16 @@ await ctx.services.oc.apply("deploy.yaml", { namespace: "prod" });
 
 ### `waitForDeployment` — validación cíclica del rollout
 
-Sondea el Deployment (o `DeploymentConfig` con `oc`) hasta que:
+Sondea el Deployment (o `DeploymentConfig` con `oc` + `resourceType: "dc"`) hasta que:
 
 - llega a **estado exitoso** (réplicas listas/actualizadas == deseadas) → resuelve con `{ status: "success", ... }`,
 - se queda en **estado Failed** más de `failedGracePeriod` sin recuperarse → lanza `DeploymentRolloutError`,
 - supera **`maxRestarts`** reinicios acumulados entre todos sus pods → lanza `DeploymentRolloutError` de inmediato, sin esperar el grace period,
 - o se cumple el **`timeout`** global sin éxito → lanza `DeploymentRolloutError`.
 
-En los tres casos de fallo, el polling se detiene ("se mata el proceso") y el error se re-lanza — listo para que `ctx.run(...)` lo capture y lo reporte automáticamente vía `ctx.notifier` (el error ya trae `command: "kubectl"` / `command: "oc"`, así que `classifiers.byCommand({ kubectl: "kubernetes" })` lo clasifica sin configuración extra).
+En los tres casos de fallo, el polling se detiene y el error se re-lanza — listo para que `ctx.run(...)` lo capture y lo reporte automáticamente vía `ctx.notifier` (el error ya trae `command: "kubectl"` / `command: "oc"`, así que `classifiers.byCommand({ kubectl: "kubernetes" })` lo clasifica sin configuración extra).
 
 ```javascript
-const { classifiers } = require("devops-cli");
-
-ctx.notifier.classify(classifiers.byCommand({ kubectl: "kubernetes", oc: "kubernetes" }));
-ctx.notifier.channel("kubernetes", senders.webhook({ url: process.env.SLACK_K8S_WEBHOOK }));
-
 await ctx.run("deploy-api", async () => {
     await ctx.services.kubectl.apply("deployment.yaml", { namespace: "prod" });
 
@@ -363,11 +328,9 @@ await ctx.run("deploy-api", async () => {
 });
 ```
 
-Con `oc`, usa `resourceType: "dc"` para apuntar a un `DeploymentConfig` clásico de OpenShift en vez de un `Deployment` nativo (default: `"deployment"`).
-
 ### `waitForDeploymentGroup` — validar todas las instancias de un mismo despliegue GitOps
 
-Pensada para el caso de GitOps donde un mismo repo termina desplegado como **varios Deployments** (una instancia por región/config/cliente, etc.), todos marcados con un label común, por ejemplo:
+Pensada para el caso de GitOps donde un mismo repo termina desplegado como **varios Deployments** (una instancia por región/config/cliente, etc.), todos marcados con un label común:
 
 ```yaml
 metadata:
@@ -375,7 +338,7 @@ metadata:
     deployment-group: repository-14
 ```
 
-`waitForDeploymentGroup` descubre todas las instancias que compartan ese label y corre `waitForDeployment` sobre **cada una en paralelo**, con el mismo `timeout`/`pollInterval`/`failedGracePeriod`/`maxRestarts` para todas:
+Descubre todas las instancias que compartan ese label y corre `waitForDeployment` sobre **cada una en paralelo**, con el mismo `timeout`/`pollInterval`/`failedGracePeriod`/`maxRestarts` para todas:
 
 ```javascript
 await ctx.run("deploy-repo-14", () =>
@@ -391,10 +354,107 @@ await ctx.run("deploy-repo-14", () =>
 ```
 
 - Si **todas** llegan a estado exitoso → resuelve con `{ status: "success", deployments: [...] }` (el detalle de cada una).
-- Si **alguna falla** (timeout individual, Failed sin recuperarse, o maxRestarts) → espera a que las demás terminen, y lanza `DeploymentGroupRolloutError` con `succeeded` (nombres que sí llegaron) y `failed` (nombres + motivo de cada una que no llegó).
+- Si **alguna falla** → espera a que las demás terminen, y lanza `DeploymentGroupRolloutError` con `succeeded` (nombres que sí llegaron) y `failed` (nombre + status + mensaje de cada una que no).
 - Si el label **no matchea ningún deployment**, también lanza `DeploymentGroupRolloutError` (grupo vacío = error, no éxito silencioso).
 
-Igual que con `waitForDeployment`, el error lleva `command: "kubectl"` / `command: "oc"`, así que se clasifica solo con `classifiers.byCommand(...)` si usas el `notifier`. Con `oc`, también acepta `resourceType: "dc"` para agrupar `DeploymentConfig`s.
+Con `oc`, ambas funciones aceptan `resourceType: "dc"` para apuntar a `DeploymentConfig` clásico en vez de `Deployment` nativo (default: `"deployment"`).
+
+## Logging commands de Azure Pipelines (`ctx.services.azdo`)
+
+```javascript
+ctx.services.azdo.setVariable("BUILD_TAG", "v1.2.3");
+ctx.services.azdo.logWarning("El caché de npm no se encontró, se reconstruye desde cero.");
+ctx.services.azdo.group("Build");
+// ... pasos ...
+ctx.services.azdo.endGroup();
+```
+
+## Notificaciones: clasificar errores por área de TI, personalizar el mensaje, y enviarlos
+
+`ctx.notifier` tiene tres responsabilidades independientes:
+
+1. **`classify()`** — decide a qué **área de TI** pertenece un error (para elegir a qué canal mandarlo).
+2. **`describeError()`** — decide el **mensaje** a reportar (reemplaza el stderr crudo por algo humano).
+3. **`channel()`** / **`onSuccess()`** — a qué **senders** se manda cada área.
+
+```javascript
+const { classifiers, messages, senders } = require("devops-cli");
+
+// 1. ¿A qué área de TI pertenece este error?
+ctx.notifier.classify(classifiers.byCommand({
+    docker: "containers",
+    kubectl: "kubernetes",
+    oc: "kubernetes",
+    terraform: "infra",
+    ansible: "infra",
+    git: "scm",
+    argocd: "cd-pipeline",
+    tkn: "cd-pipeline",
+    az: "cloud-azure"
+}));
+
+// también podés clasificar por el texto del error:
+ctx.notifier.classify(classifiers.byPattern([
+    [/permission denied|unauthorized/i, "security"],
+    [/timeout|ECONNREFUSED/i, "networking"],
+    [/no space left|ENOSPC/i, "infra"]
+]));
+
+// 2. ¿qué mensaje se reporta? (opcional — sin esto, se usa el stderr crudo)
+ctx.notifier.describeError(messages.byRule([
+    {
+        command: "docker", args: "push", pattern: /500 Internal Server Error/,
+        message: "Se ha reportado a infraestructura: falta de espacio en el registry"
+    },
+    {
+        command: "kubectl", pattern: /500/,
+        message: "El API server de Kubernetes devolvió 500, reintenta en unos minutos"
+    },
+    {
+        command: "terraform", pattern: /500/,
+        message: (error, ctx) => `Backend remoto de Terraform no respondió (env: ${ctx.params.env ?? "?"})`
+    }
+]));
+
+// 3. ¿a dónde se manda cada área?
+ctx.notifier.channel("kubernetes", senders.webhook({ url: process.env.TEAMS_WEBHOOK }));
+ctx.notifier.channel("security", senders.http({ url: "https://security.miempresa.com/incidents" }));
+ctx.notifier.channel("*", senders.file({ path: "./devops-cli-errors.log" })); // TODO error, sin importar el área
+
+// (opcional) éxito, sin clasificación de área
+ctx.notifier.onSuccess(senders.log());
+```
+
+A partir de aquí, cualquier `ctx.run(...)` o item de menú con `action` reporta automáticamente al notifier — no hay que llamarlo a mano en cada task.
+
+### Clasificadores de área (`classifiers`)
+
+| Fábrica | Uso |
+|---|---|
+| `classifiers.byCommand({ docker: "containers", ... })` | Mapea el comando que falló (adjunto automáticamente por `shell.exec`) a un área |
+| `classifiers.byPattern([[regex, area], ...])` | Matchea contra el `stderr`/mensaje del error |
+
+### Formateadores de mensaje (`messages`)
+
+| Fábrica | Uso |
+|---|---|
+| `messages.byPattern([[regex, mensaje], ...])` | Mismo mensaje sin importar el comando — solo mira el texto del error |
+| `messages.byCommand({ docker: "mensaje fijo" })` | Mensaje fijo por comando, sin importar el detalle del error |
+| `messages.byRule([{ command?, args?, pattern?, message }, ...])` | **La opción avanzada**: combina comando + sub-comando (`args`, distingue `docker push` de `docker build`) + patrón de texto, todo en modo AND. `message` puede ser un string fijo o una función `(error, ctx) => string`. Resuelve el caso de "el mismo 500 puede venir de docker, kubectl o terraform, y cada uno necesita su propio mensaje". |
+
+Si ningún classifier/formatter matchea, se usa el área `"unclassified"` y el mensaje crudo del error, respectivamente — nada se rompe si no configurás nada de esto.
+
+### Senders incluidos
+
+| Sender | Uso |
+|---|---|
+| `senders.log()` | Usa el logger interno (consola) |
+| `senders.file({ path })` | Agrega el evento como una línea JSON al archivo |
+| `senders.http({ url, method?, headers?, formatBody? })` | `POST` genérico del evento como JSON |
+| `senders.webhook({ url, format? })` | Como `http`, pero formatea `{ text: "❌ ..." }` por defecto — compatible con Slack/Discord y con **Microsoft Teams** vía Workflows (Power Automate), pasando un `format` que arme el payload de Adaptive Card que Teams espera |
+| `senders.websocket({ url, timeout? })` | Abre una conexión WS, manda el evento como JSON y cierra. Requiere Node ≥21 (usa el `WebSocket` global) |
+
+Podés escribir tu propio sender: es cualquier función `(event) => void | Promise<void>` — recibe `{ type, taskId, area?, error?, result?, message, timestamp }`.
 
 ## Tests
 
@@ -402,11 +462,21 @@ Igual que con `waitForDeployment`, el error lleva `command: "kubectl"` / `comman
 npm test
 ```
 
-Corre sobre `node:test` (sin dependencias externas): valida el `Context`, el motor `shell.exec` (retry/timeout/dryRun) y que los servicios armen los comandos correctos, interceptando `shell.exec` en vez de ejecutar binarios reales.
+`pretest` corre el build automáticamente, así los tests validan el `dist/` real que se publica (no el código fuente). Usa `node:test`, sin dependencias externas — interceptando `shell.exec` en vez de ejecutar binarios reales:
+
+- `context.test.js` — Context, flags, vars, parseArgv, dryRun global
+- `shell.test.js` — retry, timeout, dryRun del motor shell.exec
+- `services.test.js` — que docker/terraform/argocd arman bien sus argumentos
+- `menu-selector.test.js` — selección automática por flag, en cascada de varios niveles
+- `hooks-integration.test.js` — ctx.run() y items de menú con onSuccess/onError
+- `notifier.test.js` — classify/channel/onSuccess/describeError/byRule
+- `senders.test.js` — file/http/webhook/log contra servidores reales en localhost
+- `kubectl.test.js`, `oc.test.js` — kubeconfig/namespace, waitForDeployment (éxito, timeout, Failed, maxRestarts)
+- `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)
 
 ## Siguientes pasos posibles
 
 - Publicar en un registro privado (Verdaccio/Artifactory/GitHub Packages) para instalarlo con scope, p.ej. `@miorg/devops-cli`.
-- Agregar tipos (`.d.ts`) si el equipo usa TypeScript.
-- Agregar más plugins (`ansible-lint`, `trivy`, `sonar-scanner`) con el mismo patrón.
+- Agregar más plugins (`ansible-lint`, `trivy`, `sonar-scanner`) con el mismo patrón que `terraform.ts`/`docker.ts`.
 - CI propio (GitHub Actions/Azure Pipelines) que corra `npm test` en cada PR antes de `npm publish`.
+- `--catch=throw` (o similar) para que un item de menú fallido mate el proceso completo en vez de solo loguear y seguir — útil corriendo vía `--menu-selector` dentro de un step de Azure Pipelines.
