@@ -1,13 +1,14 @@
-import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import { shell, withExecOptions } from "./shell";
+import type { ExecOptions, ExecResult } from "../core/types";
 
 export interface AnsiblePlaybookOptions {
     inventory?: string;
     extraVars?: Record<string, string>;
     tags?: string;
+    exec?: ExecOptions;
 }
 
-export function playbook(playbookPath: string, { inventory, extraVars = {}, tags }: AnsiblePlaybookOptions = {}): Promise<ExecResult> {
+export function playbook(playbookPath: string, { inventory, extraVars = {}, tags, exec }: AnsiblePlaybookOptions = {}): Promise<ExecResult> {
 
     const args = ["-i", inventory || "inventory.ini", playbookPath];
 
@@ -19,11 +20,11 @@ export function playbook(playbookPath: string, { inventory, extraVars = {}, tags
         args.push("--tags", tags);
     }
 
-    return shell.exec("ansible-playbook", ...args);
+    return shell.exec("ansible-playbook", ...withExecOptions(args, exec));
 
 }
 
-export function adhoc(host: string, module: string, moduleArgs?: string): Promise<ExecResult> {
+export function adhoc(host: string, module: string, moduleArgs?: string, exec?: ExecOptions): Promise<ExecResult> {
 
     const args = [host, "-m", module];
 
@@ -31,18 +32,18 @@ export function adhoc(host: string, module: string, moduleArgs?: string): Promis
         args.push("-a", moduleArgs);
     }
 
-    return shell.exec("ansible", ...args);
+    return shell.exec("ansible", ...withExecOptions(args, exec));
 
 }
 
-export function vaultEncrypt(file: string): Promise<ExecResult> {
-    return shell.exec("ansible-vault", "encrypt", file);
+export function vaultEncrypt(file: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("ansible-vault", ...withExecOptions(["encrypt", file], exec));
 }
 
-export function vaultDecrypt(file: string): Promise<ExecResult> {
-    return shell.exec("ansible-vault", "decrypt", file);
+export function vaultDecrypt(file: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("ansible-vault", ...withExecOptions(["decrypt", file], exec));
 }
 
-export function galaxyInstall(requirementsFile: string): Promise<ExecResult> {
-    return shell.exec("ansible-galaxy", "install", "-r", requirementsFile);
+export function galaxyInstall(requirementsFile: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("ansible-galaxy", ...withExecOptions(["install", "-r", requirementsFile], exec));
 }

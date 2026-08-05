@@ -228,3 +228,14 @@ class Shell {
 
 export const shell = new Shell();
 export type { Shell };
+
+/**
+ * Helper compartido por todos los servicios (docker, git, kubectl, ...):
+ * arma la lista final de argumentos para `shell.exec`, agregando el objeto
+ * `exec` (retry/timeout/dryRun) al final SOLO si se pasó, para que el
+ * `retry`/`timeout`/`dryRun` de una llamada puntual llegue tal cual a
+ * `shell.exec` sin que cada servicio tenga que reimplementar esta lógica.
+ */
+export function withExecOptions(args: string[], exec?: ExecOptions): Array<string | ExecOptions> {
+    return exec ? [...args, exec] : args;
+}

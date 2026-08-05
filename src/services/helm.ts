@@ -1,7 +1,7 @@
-import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import { shell, withExecOptions } from "./shell";
+import type { ExecOptions, ExecResult } from "../core/types";
 
-export function install(name: string, chart: string, values?: string): Promise<ExecResult> {
+export function install(name: string, chart: string, values?: string, exec?: ExecOptions): Promise<ExecResult> {
 
     const args = ["install", name, chart];
 
@@ -9,11 +9,11 @@ export function install(name: string, chart: string, values?: string): Promise<E
         args.push("-f", values);
     }
 
-    return shell.exec("helm", ...args);
+    return shell.exec("helm", ...withExecOptions(args, exec));
 
 }
 
-export function upgrade(name: string, chart: string, values?: string): Promise<ExecResult> {
+export function upgrade(name: string, chart: string, values?: string, exec?: ExecOptions): Promise<ExecResult> {
 
     const args = ["upgrade", name, chart];
 
@@ -21,10 +21,10 @@ export function upgrade(name: string, chart: string, values?: string): Promise<E
         args.push("-f", values);
     }
 
-    return shell.exec("helm", ...args);
+    return shell.exec("helm", ...withExecOptions(args, exec));
 
 }
 
-export function uninstall(name: string): Promise<ExecResult> {
-    return shell.exec("helm", "uninstall", name);
+export function uninstall(name: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("helm", ...withExecOptions(["uninstall", name], exec));
 }

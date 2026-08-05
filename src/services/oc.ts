@@ -1,8 +1,9 @@
 import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import type { ExecOptions, ExecResult } from "../core/types";
 
 // ---------------------------------------------------------------------------
-// Opciones globales: --kubeconfig y -n/--namespace en todos los comandos
+// Opciones globales: --kubeconfig, -n/--namespace, y exec (retry/timeout/dryRun)
+// en todos los comandos
 // ---------------------------------------------------------------------------
 
 export interface OcOptions {
@@ -10,13 +11,15 @@ export interface OcOptions {
     kubeconfig?: string;
     /** Namespace/proyecto destino. Se pasa como -n <namespace>. */
     namespace?: string;
+    /** retry/timeout/dryRun para esta llamada puntual (ver shell.exec). */
+    exec?: ExecOptions;
 }
 
 function isOcOptions(value: unknown): value is OcOptions {
     return Boolean(value)
         && typeof value === "object"
         && !Array.isArray(value)
-        && ("kubeconfig" in (value as object) || "namespace" in (value as object) || Object.keys(value as object).length === 0);
+        && ("kubeconfig" in (value as object) || "namespace" in (value as object) || "exec" in (value as object) || Object.keys(value as object).length === 0);
 }
 
 function withGlobalFlags(args: string[], options: OcOptions = {}): string[] {
@@ -35,6 +38,15 @@ function withGlobalFlags(args: string[], options: OcOptions = {}): string[] {
 
 }
 
+/** Arma los args finales para shell.exec: flags (--kubeconfig/-n) + el objeto exec al final, si se pasó. */
+function toExecArgs(args: string[], options: OcOptions = {}): Array<string | ExecOptions> {
+
+    const withFlags = withGlobalFlags(args, options);
+
+    return options.exec ? [...withFlags, options.exec] : withFlags;
+
+}
+
 export interface OcLoginOptions extends OcOptions {
     server: string;
     token?: string;
@@ -47,6 +59,14 @@ export interface OcStartBuildOptions extends OcOptions {
     follow?: boolean;
 }
 
+/**
+ * Ejemplo — 10 reintentos ante un login inestable:
+ *   await ctx.services.oc.login({
+ *       server: "https://api.cluster:6443",
+ *       token: process.env.OC_TOKEN,
+ *       exec: { retry: 10, retryDelay: 2000 }
+ *   });
+ */
 export function login({ server, token, username, password, insecureSkipTlsVerify = false, ...options }: OcLoginOptions): Promise<ExecResult> {
 
     const args = ["login", server];
@@ -61,22 +81,22 @@ export function login({ server, token, username, password, insecureSkipTlsVerify
         args.push("--insecure-skip-tls-verify");
     }
 
-    return shell.exec("oc", ...withGlobalFlags(args, options));
+    return shell.exec("oc", ...toExecArgs(args, options));
 
 }
 
 export function project(name: string, options: OcOptions = {}): Promise<ExecResult> {
-    return shell.exec("oc", ...withGlobalFlags(["project", name], options));
+    return shell.exec("oc", ...toExecArgs(["project", name], options));
 }
 
 export function apply(file: string, options: OcOptions = {}): Promise<ExecResult> {
-    return shell.exec("oc", ...withGlobalFlags(["apply", "-f", file], options));
+    return shell.exec("oc", ...toExecArgs(["apply", "-f", file], options));
 }
 
 /**
  * Igual que antes (`oc.get("pods", "-o", "wide")`), pero ahora también
  * acepta OcOptions como último argumento:
- *   oc.get("pods", "-o", "wide", { namespace: "prod" })
+ *   oc.get("pods", "-o", "wide", { namespace: "prod", exec: { retry: 3 } })
  */
 export function get(...rawArgs: Array<string | OcOptions>): Promise<ExecResult> {
 
@@ -90,12 +110,12 @@ export function get(...rawArgs: Array<string | OcOptions>): Promise<ExecResult> 
         args = rawArgs.slice(0, -1) as string[];
     }
 
-    return shell.exec("oc", "get", ...withGlobalFlags(args, options));
+    return shell.exec("oc", "get", ...toExecArgs(args, options));
 
 }
 
 export function rollout(deployment: string, options: OcOptions = {}): Promise<ExecResult> {
-    return shell.exec("oc", ...withGlobalFlags(["rollout", "status", `dc/${deployment}`], options));
+    return shell.exec("oc", ...toExecArgs(["rollout", "status", `dc/${deployment}`], options));
 }
 
 export function newApp(...args: string[]): Promise<ExecResult> {
@@ -110,12 +130,12 @@ export function startBuild(buildConfig: string, { follow = true, ...options }: O
         args.push("-F");
     }
 
-    return shell.exec("oc", ...withGlobalFlags(args, options));
+    return shell.exec("oc", ...toExecArgs(args, options));
 
 }
 
 export function logs(pod: string, options: OcOptions = {}): Promise<ExecResult> {
-    return shell.exec("oc", ...withGlobalFlags(["logs", pod], options));
+    return shell.exec("oc", ...toExecArgs(["logs", pod], options));
 }
 
 // ---------------------------------------------------------------------------

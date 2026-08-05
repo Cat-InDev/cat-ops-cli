@@ -1,24 +1,28 @@
-import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import { shell, withExecOptions } from "./shell";
+import type { ExecOptions, ExecResult } from "../core/types";
 
 export interface DockerBuildOptions {
     image: string;
     context?: string;
     dockerfile?: string;
     buildArgs?: Record<string, string>;
+    /** retry/timeout/dryRun para esta llamada puntual. */
+    exec?: ExecOptions;
 }
 
 export interface DockerLoginOptions {
     registry: string;
     username: string;
     password: string;
+    exec?: ExecOptions;
 }
 
 export function build({
     image,
     context = ".",
     dockerfile,
-    buildArgs = {}
+    buildArgs = {},
+    exec
 }: DockerBuildOptions): Promise<ExecResult> {
 
     const args = ["build", "-t", image];
@@ -33,26 +37,26 @@ export function build({
 
     args.push(context);
 
-    return shell.exec("docker", ...args);
+    return shell.exec("docker", ...withExecOptions(args, exec));
 
 }
 
-export function push(image: string): Promise<ExecResult> {
-    return shell.exec("docker", "push", image);
+export function push(image: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("docker", ...withExecOptions(["push", image], exec));
 }
 
-export function tag(source: string, target: string): Promise<ExecResult> {
-    return shell.exec("docker", "tag", source, target);
+export function tag(source: string, target: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("docker", ...withExecOptions(["tag", source, target], exec));
 }
 
-export function login({ registry, username, password }: DockerLoginOptions): Promise<ExecResult> {
-    return shell.exec("docker", "login", registry, "-u", username, "-p", password);
+export function login({ registry, username, password, exec }: DockerLoginOptions): Promise<ExecResult> {
+    return shell.exec("docker", ...withExecOptions(["login", registry, "-u", username, "-p", password], exec));
 }
 
-export function pull(image: string): Promise<ExecResult> {
-    return shell.exec("docker", "pull", image);
+export function pull(image: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("docker", ...withExecOptions(["pull", image], exec));
 }
 
-export function rmi(image: string): Promise<ExecResult> {
-    return shell.exec("docker", "rmi", image);
+export function rmi(image: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("docker", ...withExecOptions(["rmi", image], exec));
 }

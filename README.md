@@ -1,4 +1,4 @@
-# devops-cli
+# catops-cli
 
 Framework para pipelines DevOps, escrito en **TypeScript** (100% usable desde JavaScript puro), empaquetado como librería npm instalable en cualquier proyecto.
 
@@ -16,53 +16,53 @@ Trae:
 **Opción A — publicado en tu registro npm (público o privado tipo Verdaccio/Artifactory/GitHub Packages):**
 
 ```bash
-npm install devops-cli
-# o si lo publicas con scope propio, p.ej. @miorg/devops-cli
-npm install @miorg/devops-cli
+npm install catops-cli
+# o si lo publicas con scope propio, p.ej. @miorg/catops-cli
+npm install @miorg/catops-cli
 ```
 
 **Opción B — sin publicar, directo desde este proyecto (útil mientras lo maduras):**
 
 ```bash
-# Dentro del repo de devops-cli
-npm pack               # genera devops-cli-<version>.tgz
+# Dentro del repo de catops-cli
+npm pack               # genera catops-cli-<version>.tgz
 
 # Dentro del proyecto que lo va a consumir
-npm install /ruta/a/devops-cli-<version>.tgz
+npm install /ruta/a/catops-cli-<version>.tgz
 ```
 
 **Opción C — enlazado local con `npm link` (para desarrollar la librería y el proyecto que la consume al mismo tiempo):**
 
 ```bash
-# Dentro del repo de devops-cli
+# Dentro del repo de catops-cli
 npm link
 
 # Dentro del proyecto consumidor
-npm link devops-cli
+npm link catops-cli
 ```
 
 **Opción D — como dependencia de Git (monorepo o repo privado, sin registro npm):**
 
 ```bash
-npm install git+https://github.com/tu-org/devops-cli.git
+npm install git+https://github.com/tu-org/catops-cli.git
 ```
 
 Cualquiera de las 4 deja disponibles dos cosas en el proyecto consumidor:
 
 1. La librería, tanto desde TS como desde JS puro:
    ```typescript
-   import { Context, Menu, services, type MenuDefinition } from "devops-cli";
+   import { Context, Menu, services, type MenuDefinition } from "catops-cli";
    ```
    ```javascript
-   const { Context, Menu, services } = require("devops-cli");
+   const { Context, Menu, services } = require("catops-cli");
    ```
-2. El binario: `npx devops-cli` (o `devops-cli` si lo instalaste global con `-g`).
+2. El binario: `npx catops-cli` (o `catops-cli` si lo instalaste global con `-g`).
 
 ## Publicar una nueva versión
 
 ```bash
 npm version patch   # o minor / major
-npm publish         # agrega --access public si usas un scope (@miorg/devops-cli)
+npm publish         # agrega --access public si usas un scope (@miorg/catops-cli)
 ```
 
 `prepublishOnly` corre el build y los tests automáticamente antes de publicar.
@@ -90,18 +90,18 @@ src/
     index.ts           -> registra todos los servicios anteriores (ServicesRegistry)
   index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, tipos
   bin/
-    devops-cli.ts      -> CLI ejecutable (busca devops.pipeline.js en el proyecto consumidor)
+    catops-cli.ts      -> CLI ejecutable (busca devops.pipeline.js en el proyecto consumidor)
 examples/
   pipeline-example.js  -> pipeline + menú + notificaciones de ejemplo, corre contra dist/
 test/
   context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
   notifier.test.js, senders.test.js, hooks-integration.test.js,
-  kubectl.test.js, oc.test.js, deployment-group.test.js
+  kubectl.test.js, oc.test.js, deployment-group.test.js, exec-options-passthrough.test.js
 ```
 
 ## Uso rápido: menú con `devops.pipeline.js` + el bin
 
-Crea un `devops.pipeline.js` (o `devops.config.js` / `.devops-cli.js`) en la raíz de tu proyecto:
+Crea un `devops.pipeline.js` (o `devops.config.js` / `.catops-cli.js`) en la raíz de tu proyecto:
 
 ```javascript
 // devops.pipeline.js
@@ -119,16 +119,16 @@ module.exports = (ctx) => ({
 ```
 
 ```bash
-npx devops-cli --debug --env=prod
+npx catops-cli --debug --env=prod
 ```
 
-`devops-cli` detecta el archivo, arma el `Context` a partir de los flags/params de `argv`, y renderiza el menú.
+`catops-cli` detecta el archivo, arma el `Context` a partir de los flags/params de `argv`, y renderiza el menú.
 
 ## Uso directo en tu propio script (p. ej. con `tsx`)
 
 ```typescript
 // src/index.ts
-import { Context, Menu, type MenuDefinition } from "devops-cli";
+import { Context, Menu, type MenuDefinition } from "catops-cli";
 
 const ctx = Context.parseArgv();
 
@@ -155,7 +155,7 @@ npm run dev -- --menu-selector=build     # con npm hace falta el "--" para reenv
 ## Uso como librería sin menú (pipeline lineal)
 
 ```javascript
-const { Context } = require("devops-cli"); // o require("./dist") dentro de este repo
+const { Context } = require("catops-cli"); // o require("./dist") dentro de este repo
 
 const ctx = Context.parseArgv(); // llena flags/params desde argv
 
@@ -210,13 +210,13 @@ Menu.render(mainMenu, ctx);
 
 ```bash
 # encadena ambos niveles en un solo comando, sin ningún prompt interactivo:
-devops-cli --menu-selector=docker --docker-action=build
+catops-cli --menu-selector=docker --docker-action=build
 
 # un solo nivel:
-devops-cli --menu-selector=deploy
+catops-cli --menu-selector=deploy
 
 # sin flags -> menú interactivo normal
-devops-cli
+catops-cli
 ```
 
 Si el valor del flag no matchea ningún `selector` del nivel actual, cae de vuelta al menú interactivo (con un warning), en vez de fallar en seco. Cada submenú revisa su **propio** `flag-selector` de forma independiente, así que podés automatizar tantos niveles como quieras encadenando flags.
@@ -247,7 +247,7 @@ await ctx.run(
 
 En ambos casos, además de tus callbacks, el resultado se reporta automáticamente al `ctx.notifier` (ver más abajo) — no hay que llamarlo a mano.
 
-## retry / timeout / dryRun en shell.exec
+## retry / timeout / dryRun — en shell.exec y en TODOS los servicios
 
 `shell.exec(command, ...args)` sigue aceptando exactamente los mismos argumentos de siempre. Si el último argumento es un objeto plano, se interpreta como opciones **solo para esa llamada**:
 
@@ -262,17 +262,43 @@ await ctx.services.shell.exec("curl", "https://flaky-api.internal", {
 });
 ```
 
-Defaults globales para todo el proceso:
+**Todos los comandos de todos los servicios** (`docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`) aceptan este mismo control, sin que cambie nada de lo que ya usabas:
+
+- Si la función ya recibía un **objeto de opciones** (la mayoría), agregale la clave `exec`:
+  ```javascript
+  await ctx.services.terraform.apply({ autoApprove: true, exec: { retry: 3 } });
+  await ctx.services.argocd.appSync("mi-app", { prune: true, exec: { retry: 3 } });
+  ```
+- Si la función recibe **argumentos posicionales** (strings sueltos), `exec` va como el **último argumento**:
+  ```javascript
+  await ctx.services.docker.push("registry/app:v1", { retry: 3 });
+  await ctx.services.git.push({ retry: 3 });
+  await ctx.services.helm.uninstall("mi-app", { retry: 3 });
+  ```
+- `kubectl` y `oc` combinan `exec` en el **mismo objeto** que ya usás para `kubeconfig`/`namespace`:
+  ```javascript
+  // 10 reintentos en un login inestable de OpenShift
+  await ctx.services.oc.login({
+      server: "https://api.cluster:6443",
+      token: process.env.OC_TOKEN,
+      namespace: "prod",
+      exec: { retry: 10, retryDelay: 2000 }
+  });
+
+  await ctx.services.kubectl.apply("deploy.yaml", { namespace: "prod", exec: { retry: 5, timeout: 30000 } });
+  ```
+
+Defaults globales para todo el proceso (afecta a todos los comandos que no pasen su propio `exec`/opciones puntuales):
 
 ```javascript
 ctx.services.shell.configure({ retry: 3, timeout: 30000 });
 ```
 
-`Context.parseArgv()` ya conecta flags de línea de comandos automáticamente:
+`Context.parseArgv()` ya conecta flags de línea de comandos automáticamente a esos defaults globales:
 
 ```bash
-npx devops-cli --dry-run             # activa dryRun global
-npx devops-cli --retry=3 --timeout=15000
+npx catops-cli --dry-run             # activa dryRun global
+npx catops-cli --retry=3 --timeout=15000
 ```
 
 ## Servicios de infraestructura incluidos
@@ -290,15 +316,15 @@ await ctx.services.tekton.pipelineStart("build-pipeline", { params: { image: "ap
 await ctx.services.az.acrBuild({ registry: "miregistro", image: "app:v1" });
 ```
 
-## kubectl / oc: kubeconfig, namespace y espera cíclica del rollout
+## kubectl / oc: kubeconfig, namespace, retry/timeout, y espera cíclica del rollout
 
-`kubectl` y `oc` aceptan `{ kubeconfig, namespace }` como último argumento en **todos** sus comandos (retrocompatible, sigue funcionando sin ese argumento):
+`kubectl` y `oc` aceptan `{ kubeconfig, namespace, exec }` como último argumento en **todos** sus comandos (retrocompatible, sigue funcionando sin ese argumento — ver la sección anterior para el detalle de `exec`):
 
 ```javascript
 await ctx.services.kubectl.apply("deploy.yaml", { kubeconfig: "/etc/kube/prod.yaml", namespace: "prod" });
-await ctx.services.kubectl.get("pods", "-o", "wide", { namespace: "staging" });
+await ctx.services.kubectl.get("pods", "-o", "wide", { namespace: "staging", exec: { retry: 3 } });
 
-await ctx.services.oc.login({ server: "https://api.cluster:6443", token, namespace: "prod" });
+await ctx.services.oc.login({ server: "https://api.cluster:6443", token, namespace: "prod", exec: { retry: 10 } });
 await ctx.services.oc.apply("deploy.yaml", { namespace: "prod" });
 ```
 
@@ -378,7 +404,7 @@ ctx.services.azdo.endGroup();
 3. **`channel()`** / **`onSuccess()`** — a qué **senders** se manda cada área.
 
 ```javascript
-const { classifiers, messages, senders } = require("devops-cli");
+const { classifiers, messages, senders } = require("catops-cli");
 
 // 1. ¿A qué área de TI pertenece este error?
 ctx.notifier.classify(classifiers.byCommand({
@@ -419,7 +445,7 @@ ctx.notifier.describeError(messages.byRule([
 // 3. ¿a dónde se manda cada área?
 ctx.notifier.channel("kubernetes", senders.webhook({ url: process.env.TEAMS_WEBHOOK }));
 ctx.notifier.channel("security", senders.http({ url: "https://security.miempresa.com/incidents" }));
-ctx.notifier.channel("*", senders.file({ path: "./devops-cli-errors.log" })); // TODO error, sin importar el área
+ctx.notifier.channel("*", senders.file({ path: "./catops-cli-errors.log" })); // TODO error, sin importar el área
 
 // (opcional) éxito, sin clasificación de área
 ctx.notifier.onSuccess(senders.log());
@@ -472,11 +498,12 @@ npm test
 - `notifier.test.js` — classify/channel/onSuccess/describeError/byRule
 - `senders.test.js` — file/http/webhook/log contra servidores reales en localhost
 - `kubectl.test.js`, `oc.test.js` — kubeconfig/namespace, waitForDeployment (éxito, timeout, Failed, maxRestarts)
+- `exec-options-passthrough.test.js` — retry/timeout/dryRun (`exec`) llegando a todos los servicios, incluyendo un retry real que se recupera tras 2 fallos
 - `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)
 
 ## Siguientes pasos posibles
 
-- Publicar en un registro privado (Verdaccio/Artifactory/GitHub Packages) para instalarlo con scope, p.ej. `@miorg/devops-cli`.
+- Publicar en un registro privado (Verdaccio/Artifactory/GitHub Packages) para instalarlo con scope, p.ej. `@miorg/catops-cli`.
 - Agregar más plugins (`ansible-lint`, `trivy`, `sonar-scanner`) con el mismo patrón que `terraform.ts`/`docker.ts`.
 - CI propio (GitHub Actions/Azure Pipelines) que corra `npm test` en cada PR antes de `npm publish`.
 - `--catch=throw` (o similar) para que un item de menú fallido mate el proceso completo en vez de solo loguear y seguir — útil corriendo vía `--menu-selector` dentro de un step de Azure Pipelines.

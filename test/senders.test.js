@@ -9,7 +9,7 @@ const { senders } = require("../dist");
 
 test("senders.file() escribe cada evento como una línea JSON", async () => {
 
-    const filePath = path.join(os.tmpdir(), `devops-cli-test-${Date.now()}.log`);
+    const filePath = path.join(os.tmpdir(), `catops-cli-test-${Date.now()}.log`);
     const sender = senders.file({ path: filePath });
 
     await sender({ type: "error", taskId: "a", message: "x", timestamp: "t" });

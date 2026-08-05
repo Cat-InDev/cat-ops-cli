@@ -1,22 +1,25 @@
-import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import { shell, withExecOptions } from "./shell";
+import type { ExecOptions, ExecResult } from "../core/types";
 
 export interface ArgoLoginOptions {
     server: string;
     username: string;
     password: string;
     insecure?: boolean;
+    exec?: ExecOptions;
 }
 
 export interface ArgoSyncOptions {
     prune?: boolean;
+    exec?: ExecOptions;
 }
 
 export interface ArgoWaitOptions {
     timeout?: number;
+    exec?: ExecOptions;
 }
 
-export function login({ server, username, password, insecure = false }: ArgoLoginOptions): Promise<ExecResult> {
+export function login({ server, username, password, insecure = false, exec }: ArgoLoginOptions): Promise<ExecResult> {
 
     const args = ["login", server, "--username", username, "--password", password];
 
@@ -24,11 +27,11 @@ export function login({ server, username, password, insecure = false }: ArgoLogi
         args.push("--insecure");
     }
 
-    return shell.exec("argocd", ...args);
+    return shell.exec("argocd", ...withExecOptions(args, exec));
 
 }
 
-export function appSync(name: string, { prune = false }: ArgoSyncOptions = {}): Promise<ExecResult> {
+export function appSync(name: string, { prune = false, exec }: ArgoSyncOptions = {}): Promise<ExecResult> {
 
     const args = ["app", "sync", name];
 
@@ -36,15 +39,15 @@ export function appSync(name: string, { prune = false }: ArgoSyncOptions = {}): 
         args.push("--prune");
     }
 
-    return shell.exec("argocd", ...args);
+    return shell.exec("argocd", ...withExecOptions(args, exec));
 
 }
 
-export function appGet(name: string): Promise<ExecResult> {
-    return shell.exec("argocd", "app", "get", name);
+export function appGet(name: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("argocd", ...withExecOptions(["app", "get", name], exec));
 }
 
-export function appWait(name: string, { timeout }: ArgoWaitOptions = {}): Promise<ExecResult> {
+export function appWait(name: string, { timeout, exec }: ArgoWaitOptions = {}): Promise<ExecResult> {
 
     const args = ["app", "wait", name];
 
@@ -52,11 +55,11 @@ export function appWait(name: string, { timeout }: ArgoWaitOptions = {}): Promis
         args.push("--timeout", String(timeout));
     }
 
-    return shell.exec("argocd", ...args);
+    return shell.exec("argocd", ...withExecOptions(args, exec));
 
 }
 
-export function appSet(name: string, params: Record<string, string> = {}): Promise<ExecResult> {
+export function appSet(name: string, params: Record<string, string> = {}, exec?: ExecOptions): Promise<ExecResult> {
 
     const args = ["app", "set", name];
 
@@ -64,14 +67,14 @@ export function appSet(name: string, params: Record<string, string> = {}): Promi
         args.push("-p", `${k}=${v}`);
     });
 
-    return shell.exec("argocd", ...args);
+    return shell.exec("argocd", ...withExecOptions(args, exec));
 
 }
 
-export function appList(): Promise<ExecResult> {
-    return shell.exec("argocd", "app", "list");
+export function appList(exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("argocd", ...withExecOptions(["app", "list"], exec));
 }
 
-export function appRollback(name: string, revisionId: string): Promise<ExecResult> {
-    return shell.exec("argocd", "app", "rollback", name, revisionId);
+export function appRollback(name: string, revisionId: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("argocd", ...withExecOptions(["app", "rollback", name, revisionId], exec));
 }

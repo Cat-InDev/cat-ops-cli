@@ -1,8 +1,9 @@
 import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import type { ExecOptions, ExecResult } from "../core/types";
 
 // ---------------------------------------------------------------------------
-// Opciones globales: --kubeconfig y -n/--namespace en todos los comandos
+// Opciones globales: --kubeconfig, -n/--namespace, y exec (retry/timeout/dryRun)
+// en todos los comandos
 // ---------------------------------------------------------------------------
 
 export interface KubectlOptions {
@@ -10,13 +11,15 @@ export interface KubectlOptions {
     kubeconfig?: string;
     /** Namespace destino. Se pasa como -n <namespace>. */
     namespace?: string;
+    /** retry/timeout/dryRun para esta llamada puntual (ver shell.exec). */
+    exec?: ExecOptions;
 }
 
 function isKubectlOptions(value: unknown): value is KubectlOptions {
     return Boolean(value)
         && typeof value === "object"
         && !Array.isArray(value)
-        && ("kubeconfig" in (value as object) || "namespace" in (value as object) || Object.keys(value as object).length === 0);
+        && ("kubeconfig" in (value as object) || "namespace" in (value as object) || "exec" in (value as object) || Object.keys(value as object).length === 0);
 }
 
 function withGlobalFlags(args: string[], options: KubectlOptions = {}): string[] {
@@ -35,18 +38,27 @@ function withGlobalFlags(args: string[], options: KubectlOptions = {}): string[]
 
 }
 
+/** Arma los args finales para shell.exec: flags (--kubeconfig/-n) + el objeto exec al final, si se pasó. */
+function toExecArgs(args: string[], options: KubectlOptions = {}): Array<string | ExecOptions> {
+
+    const withFlags = withGlobalFlags(args, options);
+
+    return options.exec ? [...withFlags, options.exec] : withFlags;
+
+}
+
 export function apply(file: string, options: KubectlOptions = {}): Promise<ExecResult> {
-    return shell.exec("kubectl", ...withGlobalFlags(["apply", "-f", file], options));
+    return shell.exec("kubectl", ...toExecArgs(["apply", "-f", file], options));
 }
 
 export function del(file: string, options: KubectlOptions = {}): Promise<ExecResult> {
-    return shell.exec("kubectl", ...withGlobalFlags(["delete", "-f", file], options));
+    return shell.exec("kubectl", ...toExecArgs(["delete", "-f", file], options));
 }
 
 /**
  * Igual que antes (`kubectl.get("pods", "-o", "wide")`), pero ahora también
  * acepta KubectlOptions como último argumento:
- *   kubectl.get("pods", "-o", "wide", { namespace: "prod" })
+ *   kubectl.get("pods", "-o", "wide", { namespace: "prod", exec: { retry: 3 } })
  */
 export function get(...rawArgs: Array<string | KubectlOptions>): Promise<ExecResult> {
 
@@ -60,20 +72,20 @@ export function get(...rawArgs: Array<string | KubectlOptions>): Promise<ExecRes
         args = rawArgs.slice(0, -1) as string[];
     }
 
-    return shell.exec("kubectl", "get", ...withGlobalFlags(args, options));
+    return shell.exec("kubectl", "get", ...toExecArgs(args, options));
 
 }
 
 export function logs(pod: string, options: KubectlOptions = {}): Promise<ExecResult> {
-    return shell.exec("kubectl", ...withGlobalFlags(["logs", pod], options));
+    return shell.exec("kubectl", ...toExecArgs(["logs", pod], options));
 }
 
 export function rolloutStatus(deployment: string, options: KubectlOptions = {}): Promise<ExecResult> {
-    return shell.exec("kubectl", ...withGlobalFlags(["rollout", "status", deployment], options));
+    return shell.exec("kubectl", ...toExecArgs(["rollout", "status", deployment], options));
 }
 
 export function setImage(resource: string, image: string, options: KubectlOptions = {}): Promise<ExecResult> {
-    return shell.exec("kubectl", ...withGlobalFlags(["set", "image", resource, image], options));
+    return shell.exec("kubectl", ...toExecArgs(["set", "image", resource, image], options));
 }
 
 export { del as delete };

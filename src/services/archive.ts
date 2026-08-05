@@ -1,14 +1,14 @@
-import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import { shell, withExecOptions } from "./shell";
+import type { ExecOptions, ExecResult } from "../core/types";
 
-export function zip(source: string, target: string): Promise<ExecResult> {
-    return shell.exec("zip", "-r", target, source);
+export function zip(source: string, target: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("zip", ...withExecOptions(["-r", target, source], exec));
 }
 
-export function unzip(file: string, target: string): Promise<ExecResult> {
-    return shell.exec("unzip", file, "-d", target);
+export function unzip(file: string, target: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("unzip", ...withExecOptions([file, "-d", target], exec));
 }
 
-export function tar(source: string, target: string): Promise<ExecResult> {
-    return shell.exec("tar", "-czf", target, source);
+export function tar(source: string, target: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("tar", ...withExecOptions(["-czf", target, source], exec));
 }

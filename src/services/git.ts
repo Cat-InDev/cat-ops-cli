@@ -1,34 +1,34 @@
-import { shell } from "./shell";
-import type { ExecResult } from "../core/types";
+import { shell, withExecOptions } from "./shell";
+import type { ExecOptions, ExecResult } from "../core/types";
 
-export function clone(url: string, targetPath: string): Promise<ExecResult> {
-    return shell.exec("git", "clone", url, targetPath);
+export function clone(url: string, targetPath: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["clone", url, targetPath], exec));
 }
 
-export function checkout(branch: string): Promise<ExecResult> {
-    return shell.exec("git", "checkout", branch);
+export function checkout(branch: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["checkout", branch], exec));
 }
 
-export function pull(): Promise<ExecResult> {
-    return shell.exec("git", "pull");
+export function pull(exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["pull"], exec));
 }
 
-export function fetch(): Promise<ExecResult> {
-    return shell.exec("git", "fetch", "--all");
+export function fetch(exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["fetch", "--all"], exec));
 }
 
-export function tag(name: string): Promise<ExecResult> {
-    return shell.exec("git", "tag", name);
+export function tag(name: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["tag", name], exec));
 }
 
-export function commit(message: string): Promise<ExecResult> {
-    return shell.exec("git", "commit", "-m", message);
+export function commit(message: string, exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["commit", "-m", message], exec));
 }
 
-export function push(): Promise<ExecResult> {
-    return shell.exec("git", "push");
+export function push(exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["push"], exec));
 }
 
-export function revParse(): Promise<ExecResult> {
-    return shell.exec("git", "rev-parse", "HEAD");
+export function revParse(exec?: ExecOptions): Promise<ExecResult> {
+    return shell.exec("git", ...withExecOptions(["rev-parse", "HEAD"], exec));
 }
