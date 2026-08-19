@@ -14,6 +14,7 @@ import * as az from "./az";
 import * as azdo from "./azdo";
 import * as http from "./http";
 import { PipelineRegistry } from "./pipeline";
+import { YamlService } from "./yaml";
 
 export const services = {
     shell,
@@ -31,7 +32,8 @@ export const services = {
     az,
     azdo,
     http,
-    pipeline: new PipelineRegistry()
+    pipeline: new PipelineRegistry(),
+    yaml: new YamlService()
 };
 
 export type ServicesRegistry = typeof services;
@@ -55,3 +57,5 @@ export {
 };
 
 export { PipelineRegistry } from "./pipeline";
+export { YamlService } from "./yaml";
+export type { YamlPrepareActions } from "./yaml";

@@ -5,7 +5,7 @@ Framework para pipelines DevOps, escrito en **TypeScript** (100% usable desde Ja
 Trae:
 
 - Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
-- **15 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`) + un **motor de pipelines** declarativo con dependencias (`Pipeline`).
+- **16 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`, `yaml`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`) + un **motor de pipelines** declarativo con dependencias (`Pipeline`).
 - **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout.
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
 - **retry / timeout / dryRun** en cada comando de shell.
@@ -52,10 +52,10 @@ Cualquiera de las 4 deja disponibles dos cosas en el proyecto consumidor:
 
 1. La librería, tanto desde TS como desde JS puro:
    ```typescript
-   import { Context, Menu, services, type MenuDefinition } from "catops-cli";
+   import { Context, Menu, services, YamlService, type MenuDefinition } from "catops-cli";
    ```
    ```javascript
-   const { Context, Menu, services } = require("catops-cli");
+   const { Context, Menu, services, YamlService } = require("catops-cli");
    ```
 2. El binario: `npx catops-cli` (o `catops-cli` si lo instalaste global con `-g`).
 
@@ -89,7 +89,8 @@ src/
     http.ts           -> cliente HTTP con interceptores de request/response, múltiples instancias
     http-types.ts     -> tipos del servicio HTTP (HttpRequest, HttpResponse, interceptors, ...)
     docker.ts, git.ts, kubectl.ts, helm.ts, npm.ts, archive.ts
-    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts,     az.ts, azdo.ts, azdo-api.ts, pipeline.ts
+    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts, az.ts, azdo.ts, azdo-api.ts, pipeline.ts
+    yaml.ts              -> YamlService: manipulación de archivos YAML con prepare(), multidocument, comentarios
     index.ts           -> registra todos los servicios anteriores (ServicesRegistry)
   index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, http, tipos
   bin/
@@ -100,8 +101,8 @@ test/
     context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
   notifier.test.js, senders.test.js, hooks-integration.test.js,
   http.test.js, kubectl.test.js, oc.test.js, deployment-group.test.js,
-  exec-options-passthrough.test.js, azdo-api.test.js, pipeline.test.js,
-  service-notify.test.js
+  exec-options-passthrough.test.js,   azdo-api.test.js, pipeline.test.js,
+  service-notify.test.js, yaml.test.js
 ```
 
 ## Uso rápido: menú con `devops.pipeline.js` + el bin
@@ -1223,6 +1224,170 @@ const docker = ctx.wrap(ctx.services.docker, "docker");
 docker.version; // pasa directo, sin proxy
 ```
 
+## Servicio YAML: manipulación de archivos de configuración (`ctx.services.yaml`)
+
+Un servicio para leer, modificar y serializar archivos YAML con soporte para operaciones declarativas, comentarios, y documentos múltiples.
+
+### Uso básico
+
+```typescript
+// Parsear YAML desde string
+ctx.services.yaml.fromYaml(`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  ENV: production
+`);
+
+// Obtener valores
+ctx.services.yaml.yamlGet("metadata.name");            // "app-config"
+ctx.services.yaml.yamlGet("data.ENV", "default");     // "production"
+
+// Asignar valores (crea paths nuevos si no existen)
+ctx.services.yaml.yamlSet(["data", "DEBUG"], "false");
+
+// Serializar a YAML
+const yamlString = ctx.services.yaml.yamlify();
+
+// Serializar a JSON
+const jsonString = ctx.services.yaml.stringify();
+```
+
+### Trabajar con JSON
+
+```typescript
+// Convertir JSON a YAML interno
+ctx.services.yaml.fromJson({
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: "api-service" }
+});
+
+// Obtener como objeto JSON
+const obj = ctx.services.yaml.jsonify();
+```
+
+### Arrays y omisión de keys
+
+```typescript
+// Agregar elementos a un array
+ctx.services.yaml.yamlPush(["data", "ALLOWED_HOSTS"], ["host1.example.com", "host2.example.com"]);
+
+// Concatenar al inicio de un string
+ctx.services.yaml.yamlConcatInitAndSet(["data", "PREFIX"], "prod-");  // "prod-valor-anterior"
+
+// Eliminar paths del documento
+ctx.services.yaml.yamlOmit(["data", "DEBUG", "data", "TEMP"]);
+```
+
+### Comentarios
+
+```typescript
+// Agregar commentBefore a un nodo específico
+ctx.services.yaml.comment("Configuración del backend", ["data", "BACKEND_URL"]);
+```
+
+### Declaraciones batch con `prepare()`
+
+`prepare()` permite aplicar múltiples mutaciones en una sola llamada — ideal para transformaciones complejas:
+
+```typescript
+ctx.services.yaml.prepare({
+    // Asignar valores por path
+    $set: [
+        { path: "apiVersion", value: "v1" },
+        { path: "metadata.labels.env", value: "production" }
+    ],
+
+    // Agregar a arrays
+    $push: [
+        { path: "spec.containers", value: { name: "sidecar", image: "proxy:v1" } }
+    ],
+
+    // Fusionar objetos existentes
+    $spread: [
+        { path: "metadata.labels", value: { version: "v2", team: "platform" } }
+    ],
+
+    // Asignar el mismo valor a múltiples paths
+    $superSet: {
+        value: "true",
+        $set: ["data.ENABLE_FEATURE_A", "data.ENABLE_FEATURE_B"],
+        $init: ["data.PREFIX"]  // concatena al inicio en vez de reemplazar
+    },
+
+    // Asignar valores por path (shorthand)
+    $merge: {
+        "data.RETRY_COUNT": "3",
+        "data.TIMEOUT": "30000"
+    },
+
+    // Eliminar keys
+    $delete: ["data.DEBUG", "data.TEMP"]
+});
+```
+
+### Documentos múltiples
+
+Para archivos YAML con múltiples documentos separados por `---`:
+
+```typescript
+// Crear documentos múltiples
+ctx.services.yaml.multidocument(
+    { yaml: "kind: Deployment\nmetadata:\n  name: api", name: "deployment" },
+    { replicas: 3 }  // apply extra values sobre el nuevo doc
+);
+
+ctx.services.yaml.multidocument(
+    { yaml: "kind: Service\nmetadata:\n  name: api-svc", name: "service" }
+);
+
+// Cambiar entre documentos
+ctx.services.yaml.use("deployment");
+console.log(ctx.services.yaml.yamlify());  // imprime el doc "deployment"
+
+ctx.services.yaml.use("service");
+console.log(ctx.services.yaml.yamlify());  // imprime el doc "service"
+
+// Verificar si un documento existe
+ctx.services.yaml.existDocument("deployment");  // true
+```
+
+### Clonar
+
+```typescript
+const clone = ctx.services.yaml.clone();
+// clone es independiente — modificar uno no afecta al otro
+```
+
+### Parsear YAML vacío
+
+```typescript
+ctx.services.yaml.fromYaml("");  // crea documento vacío, no lanza error
+```
+
+### Ejemplo completo: modificar un Deployment de Kubernetes
+
+```typescript
+ctx.services.yaml.fromYaml(readFileSync("deployment.yaml", "utf8"));
+
+ctx.services.yaml.prepare({
+    $set: [
+        { path: "spec.template.metadata.labels.version", value: "v2.1.0" },
+        { path: "spec.template.spec.containers.0.image", value: "registry/app:v2.1.0" }
+    ],
+    $spread: [
+        { path: "spec.template.metadata.annotations", value: { "deployed-at": new Date().toISOString() } }
+    ],
+    $delete: ["spec.template.spec.initContainers"]
+});
+
+const updatedYaml = ctx.services.yaml.yamlify();
+writeFileSync("deployment.yaml", updatedYaml);
+```
+
 ## Tests
 
 ```bash
@@ -1245,6 +1410,7 @@ npm test
 - `azdo-api.test.js` — AzureDevOpsApi contra mock server: proyectos, repos, branches, commits, PRs, builds, pipelines, work items, overrides
 - `pipeline.test.js` — Pipeline motor: stages/jobs/tasks, dependencias cross-level con paths dotted, resultados jerárquicos (stage.job.task), fluent API, registry, reset, ctx access, detección de tipo por propiedad, PipelineResultsAccessor
 - `service-notify.test.js` — ServiceError, ctx.wrap(), Notifier con service/method/args, classifiers.byService/messages.byService, unwrap de ServiceError en byCommand/byPattern/byRule, integración completa, backward compat
+- `yaml.test.js` — YamlService: fromYaml/fromJson, yamlGet/yamlSet/yamlPush/yamlOmit, comment(), prepare() con $set/$push/$spread/$superSet/$merge/$delete, multidocument/use/clone
 
 ## Siguientes pasos posibles
 
@@ -1252,3 +1418,4 @@ npm test
 - Agregar más plugins (`ansible-lint`, `trivy`, `sonar-scanner`) con el mismo patrón que `terraform.ts`/`docker.ts`.
 - CI propio (GitHub Actions/Azure Pipelines) que corra `npm test` en cada PR antes de `npm publish`.
 - `--catch=throw` (o similar) para que un item de menú fallido mate el proceso completo en vez de solo loguear y seguir — útil corriendo vía `--menu-selector` dentro de un step de Azure Pipelines.
+- Exportar tipos YAML (`YamlPrepareActions`) y crear helpers para templates comunes (Kubernetes manifests, Helm values, etc.).
