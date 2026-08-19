@@ -61,9 +61,11 @@ function normalizeFlagName(flagSelector: string): string {
 }
 
 function errorMessage(error: unknown): string {
-    return error instanceof Error
-        ? error.message
-        : (error as { stderr?: string })?.stderr ?? String(error);
+    if (error instanceof Error) return error.message;
+
+    const execError = error as { stdout?: string; stderr?: string };
+
+    return execError?.stderr ?? execError?.stdout ?? String(error);
 }
 
 export class Menu {

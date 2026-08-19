@@ -4,19 +4,21 @@ import type { ErrorMessageFormatter } from "./types";
 interface ExecLikeError {
     command?: string;
     args?: string[];
+    stdout?: string;
     stderr?: string;
     message?: string;
 }
 
 function textOf(error: unknown): string {
     const execError = error as ExecLikeError;
-    return execError?.stderr || execError?.message || String(error);
+    return execError?.stderr || execError?.stdout || execError?.message || String(error);
 }
 
 /**
  * Formateador de fábrica: prueba una lista de [regex, mensaje] contra el
- * stderr/mensaje del error y devuelve el mensaje personalizado del primer
- * patrón que matchee, en vez del stderr crudo.
+ * stderr (o stdout si stderr viene vacío, p. ej. errores de `oc` que se
+ * imprimen en stdout) /mensaje del error y devuelve el mensaje personalizado
+ * del primer patrón que matchee, en vez del stderr crudo.
  *
  * Ojo: esto NO distingue por comando — un mismo patrón (ej. "500 Internal
  * Server Error") aplica igual venga de `docker`, `kubectl` o `terraform`.

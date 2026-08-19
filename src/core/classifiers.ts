@@ -2,6 +2,7 @@ import type { ErrorClassifier } from "./types";
 
 interface ExecLikeError {
     command?: string;
+    stdout?: string;
     stderr?: string;
     message?: string;
 }
@@ -39,7 +40,8 @@ export function byCommand(map: Record<string, string>): ErrorClassifier {
 
 /**
  * Clasificador de fábrica: prueba una lista de [regex, área] contra el
- * stderr/mensaje del error y devuelve el área del primer patrón que matchee.
+ * stderr (o stdout si stderr viene vacío) /mensaje del error y devuelve el
+ * área del primer patrón que matchee.
  *
  * Ejemplo:
  *   notifier.classify(classifiers.byPattern([
@@ -53,7 +55,7 @@ export function byPattern(rules: Array<[RegExp, string]>): ErrorClassifier {
     return (error: unknown) => {
 
         const execError = error as ExecLikeError;
-        const text = execError?.stderr || execError?.message || String(error);
+        const text = execError?.stderr || execError?.stdout || execError?.message || String(error);
 
         for (const [pattern, area] of rules) {
             if (pattern.test(text)) {

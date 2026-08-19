@@ -81,6 +81,18 @@ test("classifiers.byPattern matchea contra el stderr del error", () => {
 
 });
 
+test("classifiers.byPattern matchea contra stdout cuando stderr está vacío", () => {
+
+    const classify = classifiers.byPattern([
+        [/500/, "infra"],
+        [/unauthorized|403/i, "security"]
+    ]);
+
+    assert.equal(classify({ command: "oc", stdout: "Error: 500 Internal Server Error", stderr: "" }), "infra");
+    assert.equal(classify({ command: "oc", stdout: "403 Forbidden", stderr: "" }), "security");
+
+});
+
 test("notifier.describeError() reemplaza el mensaje crudo cuando matchea", async () => {
 
     const notifier = new Notifier();
@@ -110,6 +122,44 @@ test("notifier.describeError() cae al mensaje crudo si ningún formatter matchea
     await notifier.reportError("t", { stderr: "algo random sin match" }, {});
 
     assert.equal(received.message, "algo random sin match");
+
+});
+
+test("notifier.describeError() con byPattern matchea el error que viene en stdout (oc login)", async () => {
+
+    const notifier = new Notifier();
+    let received;
+
+    notifier.describeError(messages.byPattern([
+        [/500 Internal Server Error/, "Se ha reportado a infraestructura: falta de espacio en el registry"],
+        [/unauthorized|403/i, "Credenciales inválidas contra el registry, revisa el secret"]
+    ]));
+    notifier.channel("unclassified", event => { received = event; });
+
+    await notifier.reportError("login", {
+        command: "oc",
+        stdout: "Error from server (InternalError): 500 Internal Server Error",
+        stderr: ""
+    }, {});
+
+    assert.equal(received.message, "Se ha reportado a infraestructura: falta de espacio en el registry");
+
+});
+
+test("el mensaje crudo usa stdout (última línea) cuando stderr está vacío", async () => {
+
+    const notifier = new Notifier();
+    let received;
+
+    notifier.channel("unclassified", event => { received = event; });
+
+    await notifier.reportError("login", {
+        command: "oc",
+        stdout: "primera línea\n500 Internal Server Error",
+        stderr: ""
+    }, {});
+
+    assert.equal(received.message, "500 Internal Server Error");
 
 });
 

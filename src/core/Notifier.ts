@@ -9,17 +9,16 @@ function toMessage(error: unknown): string {
         return error.message;
     }
 
-    const maybeExecError = error as { stderr?: string; message?: string } | undefined;
+    const maybeExecError = error as { stdout?: string; stderr?: string; message?: string } | undefined;
 
-    if (maybeExecError?.stderr) {
-        return maybeExecError.stderr.trim().split("\n").pop() || maybeExecError.stderr;
-    }
+    const lastLine = (text: string | undefined): string | undefined => {
+        return text ? text.trim().split("\n").pop() || text : undefined;
+    };
 
-    if (maybeExecError?.message) {
-        return maybeExecError.message;
-    }
-
-    return String(error);
+    return lastLine(maybeExecError?.stderr)
+        || lastLine(maybeExecError?.stdout)
+        || maybeExecError?.message
+        || String(error);
 
 }
 

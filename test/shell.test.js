@@ -20,6 +20,21 @@ test("shell.exec reintenta según options.retry y finalmente rechaza", async () 
     );
 });
 
+test("shell.exec rechaza con code 1 aunque el error salga por stdout y conserva ese stdout en el error", async () => {
+    await assert.rejects(
+        () => shell.exec(
+            "node",
+            "-e",
+            "console.log('Error from server (InternalError): 500 Internal Server Error'); process.exit(1)"
+        ),
+        error => {
+            assert.equal(error.code, 1);
+            assert.match(error.stdout, /500 Internal Server Error/);
+            return true;
+        }
+    );
+});
+
 test("shell.exec aplica timeout y mata el proceso", async () => {
     await assert.rejects(
         () => shell.exec("sleep", "3", { timeout: 200, retry: 1 }),

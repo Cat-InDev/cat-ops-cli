@@ -400,7 +400,7 @@ ctx.services.azdo.endGroup();
 `ctx.notifier` tiene tres responsabilidades independientes:
 
 1. **`classify()`** — decide a qué **área de TI** pertenece un error (para elegir a qué canal mandarlo).
-2. **`describeError()`** — decide el **mensaje** a reportar (reemplaza el stderr crudo por algo humano).
+2. **`describeError()`** — decide el **mensaje** a reportar (reemplaza el stderr/stdout crudo por algo humano).
 3. **`channel()`** / **`onSuccess()`** — a qué **senders** se manda cada área.
 
 ```javascript
@@ -426,7 +426,7 @@ ctx.notifier.classify(classifiers.byPattern([
     [/no space left|ENOSPC/i, "infra"]
 ]));
 
-// 2. ¿qué mensaje se reporta? (opcional — sin esto, se usa el stderr crudo)
+// 2. ¿qué mensaje se reporta? (opcional — sin esto, se usa el stderr/stdout crudo)
 ctx.notifier.describeError(messages.byRule([
     {
         command: "docker", args: "push", pattern: /500 Internal Server Error/,
@@ -458,15 +458,24 @@ A partir de aquí, cualquier `ctx.run(...)` o item de menú con `action` reporta
 | Fábrica | Uso |
 |---|---|
 | `classifiers.byCommand({ docker: "containers", ... })` | Mapea el comando que falló (adjunto automáticamente por `shell.exec`) a un área |
-| `classifiers.byPattern([[regex, area], ...])` | Matchea contra el `stderr`/mensaje del error |
+| `classifiers.byPattern([[regex, area], ...])` | Matchea contra el `stderr`/`stdout`/mensaje del error |
 
 ### Formateadores de mensaje (`messages`)
 
 | Fábrica | Uso |
 |---|---|
-| `messages.byPattern([[regex, mensaje], ...])` | Mismo mensaje sin importar el comando — solo mira el texto del error |
+| `messages.byPattern([[regex, mensaje], ...])` | Mismo mensaje sin importar el comando — solo mira el texto del error (`stderr`, o `stdout` si `stderr` viene vacío) |
 | `messages.byCommand({ docker: "mensaje fijo" })` | Mensaje fijo por comando, sin importar el detalle del error |
 | `messages.byRule([{ command?, args?, pattern?, message }, ...])` | **La opción avanzada**: combina comando + sub-comando (`args`, distingue `docker push` de `docker build`) + patrón de texto, todo en modo AND. `message` puede ser un string fijo o una función `(error, ctx) => string`. Resuelve el caso de "el mismo 500 puede venir de docker, kubectl o terraform, y cada uno necesita su propio mensaje". |
+
+> **Errores que salen por `stdout` en vez de `stderr`:** algunos comandos (p. ej. `oc login`, o errores HTTP del API server) imprimen el mensaje en `stdout` y aun así salen con exit code ≠ 0. Como `shell.exec` rechaza con el `ExecResult` completo (que conserva `stdout` y `stderr`), todos los formateadores/clasificadores de `messages`/`classifiers` prueban primero `stderr` y, si viene vacío, caen a `stdout`. No hace falta configuración extra — el mismo `describeError`/`classify` que usás hoy funciona aunque el texto vaya por stdout:
+
+```javascript
+ctx.notifier.describeError(messages.byPattern([
+    [/500 Internal Server Error/, "Se ha reportado a infraestructura: falta de espacio en el registry"],
+    [/unauthorized|403/i, "Credenciales inválidas contra el registry, revisa el secret"]
+]));
+```
 
 Si ningún classifier/formatter matchea, se usa el área `"unclassified"` y el mensaje crudo del error, respectivamente — nada se rompe si no configurás nada de esto.
 
