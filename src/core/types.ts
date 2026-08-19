@@ -29,6 +29,44 @@ export interface ExecOptions {
 }
 
 // ---------------------------------------------------------------------------
+// ServiceError — error enriquecido con metadata del servicio
+// ---------------------------------------------------------------------------
+
+/**
+ * Error generado por `ctx.wrap()` cuando un servicio falla. Enriches el error
+ * original con el nombre del servicio, el método invocado y los argumentos,
+ * para que classifiers y formatters puedan resolver el área y el mensaje
+ * humano a partir de esa metadata.
+ *
+ * La propiedad `cause` contiene el error original (puede ser un ExecResult,
+ * un HttpError, un Error nativo, etc.).
+ */
+export class ServiceError extends Error {
+    readonly service: string;
+    readonly method: string;
+    readonly args: unknown[];
+    readonly cause: unknown;
+
+    constructor(service: string, method: string, args: unknown[], cause: unknown) {
+        const originalMessage = cause instanceof Error
+            ? cause.message
+            : (cause as { message?: string })?.message ?? String(cause);
+
+        super(`${service}.${method}: ${originalMessage}`);
+
+        this.name = "ServiceError";
+        this.service = service;
+        this.method = method;
+        this.args = args;
+        this.cause = cause;
+
+        if (cause instanceof Error && cause.stack) {
+            this.stack = `${this.message}\n\n--- Original stack ---\n${cause.stack}`;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Callbacks de éxito/error por tarea
 // ---------------------------------------------------------------------------
 
@@ -54,6 +92,12 @@ export interface NotificationEvent {
     result?: unknown;
     message: string;
     timestamp: string;
+    /** Servicio que falló (solo en errores de servicios envueltos con ctx.wrap). */
+    service?: string;
+    /** Método del servicio que falló. */
+    method?: string;
+    /** Argumentos pasados al método. */
+    args?: unknown[];
 }
 
 /**

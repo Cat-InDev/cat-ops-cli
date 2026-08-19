@@ -10,7 +10,7 @@ Trae:
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
 - **retry / timeout / dryRun** en cada comando de shell.
 - Validación cíclica de rollouts de Kubernetes/OpenShift (`waitForDeployment`, `waitForDeploymentGroup`).
-- **Callbacks de éxito/error por tarea** + un sistema de **notificaciones clasificadas por área de TI**, con mensajes personalizables y senders (`log`, `file`, `http`, `webhook`, `websocket`).
+- **Callbacks de éxito/error por tarea** + un sistema de **notificaciones clasificadas por área de TI**, con mensajes personalizables y senders (`log`, `file`, `http`, `webhook`, `websocket`). Incluye `ctx.wrap()` para monitoreo automático de servicios con metadata de servicio/método/argumentos.
 
 ## Instalación
 
@@ -75,15 +75,15 @@ Todo `src/` está escrito en TypeScript, con `strict: true`. `npm run build` com
 ```
 src/
   core/
-    Context.ts       -> ExecutionContext singleton (Context.current() / Context.parseArgv())
+    Context.ts       -> ExecutionContext singleton (Context.current() / Context.parseArgv() / ctx.wrap())
     Menu.ts           -> Menu.render() con navegación anidada + selección automática por flag
     Notifier.ts       -> clasificación de errores por área + canales + senders
-    classifiers.ts    -> fábricas de ErrorClassifier: byCommand, byPattern
-    messages.ts        -> fábricas de ErrorMessageFormatter: byPattern, byCommand, byRule
+    classifiers.ts    -> fábricas de ErrorClassifier: byCommand, byPattern, byService
+    messages.ts        -> fábricas de ErrorMessageFormatter: byPattern, byCommand, byRule, byService
     senders.ts          -> fábricas de Sender: log, file, http, webhook, websocket
     prompt.ts            -> ctx.ask / ctx.confirm / ctx.select (sin dependencias externas)
     logger.ts             -> logger usado por Context y por shell.ts
-    types.ts               -> tipos compartidos (MenuDefinition, ExecOptions, NotificationEvent, ...)
+    types.ts               -> tipos compartidos (MenuDefinition, ExecOptions, NotificationEvent, ServiceError, ...)
   services/
     shell.ts          -> motor base (spawn), con retry/timeout/dryRun
     http.ts           -> cliente HTTP con interceptores de request/response, múltiples instancias
@@ -97,10 +97,11 @@ src/
 examples/
   pipeline-example.js  -> pipeline + menú + notificaciones de ejemplo, corre contra dist/
 test/
-  context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
+    context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
   notifier.test.js, senders.test.js, hooks-integration.test.js,
   http.test.js, kubectl.test.js, oc.test.js, deployment-group.test.js,
-  exec-options-passthrough.test.js, azdo-api.test.js, pipeline.test.js
+  exec-options-passthrough.test.js, azdo-api.test.js, pipeline.test.js,
+  service-notify.test.js
 ```
 
 ## Uso rápido: menú con `devops.pipeline.js` + el bin
@@ -1078,16 +1079,18 @@ A partir de aquí, cualquier `ctx.run(...)` o item de menú con `action` reporta
 
 | Fábrica | Uso |
 |---|---|
-| `classifiers.byCommand({ docker: "containers", ... })` | Mapea el comando que falló (adjunto automáticamente por `shell.exec`) a un área |
-| `classifiers.byPattern([[regex, area], ...])` | Matchea contra el `stderr`/`stdout`/mensaje del error |
+| `classifiers.byCommand({ docker: "containers", ... })` | Mapea el comando que falló (adjunto automáticamente por `shell.exec`) a un área. También funciona con `ServiceError`: unwrappea `cause.command` automáticamente. |
+| `classifiers.byPattern([[regex, area], ...])` | Matchea contra el `stderr`/`stdout`/mensaje del error. Unwrappea `ServiceError.cause` para extraer el texto. |
+| `classifiers.byService({ docker: "containers", ... })` | Mapea el nombre del **servicio** que falló a un área. Solo matchea `ServiceError` (generados por `ctx.wrap()`). |
 
 ### Formateadores de mensaje (`messages`)
 
 | Fábrica | Uso |
 |---|---|
-| `messages.byPattern([[regex, mensaje], ...])` | Mismo mensaje sin importar el comando — solo mira el texto del error (`stderr`, o `stdout` si `stderr` viene vacío) |
-| `messages.byCommand({ docker: "mensaje fijo" })` | Mensaje fijo por comando, sin importar el detalle del error |
-| `messages.byRule([{ command?, args?, pattern?, message }, ...])` | **La opción avanzada**: combina comando + sub-comando (`args`, distingue `docker push` de `docker build`) + patrón de texto, todo en modo AND. `message` puede ser un string fijo o una función `(error, ctx) => string`. Resuelve el caso de "el mismo 500 puede venir de docker, kubectl o terraform, y cada uno necesita su propio mensaje". |
+| `messages.byPattern([[regex, mensaje], ...])` | Mismo mensaje sin importar el comando — solo mira el texto del error (`stderr`, o `stdout` si `stderr` viene vacío). Unwrappea `ServiceError.cause`. |
+| `messages.byCommand({ docker: "mensaje fijo" })` | Mensaje fijo por comando, sin importar el detalle del error. Unwrappea `ServiceError.cause.command`. |
+| `messages.byRule([{ command?, args?, pattern?, message }, ...])` | **La opción avanzada**: combina comando + sub-comando (`args`, distingue `docker push` de `docker build`) + patrón de texto, todo en modo AND. `message` puede ser un string fijo o una función `(error, ctx) => string`. Resuelve el caso de "el mismo 500 puede venir de docker, kubectl o terraform, y cada uno necesita su propio mensaje". Unwrappea `ServiceError.cause`. |
+| `messages.byService({ docker: "mensaje fijo" })` | Mensaje fijo por nombre de servicio. Solo matchea `ServiceError` (generados por `ctx.wrap()`). |
 
 > **Errores que salen por `stdout` en vez de `stderr`:** algunos comandos (p. ej. `oc login`, o errores HTTP del API server) imprimen el mensaje en `stdout` y aun así salen con exit code ≠ 0. Como `shell.exec` rechaza con el `ExecResult` completo (que conserva `stdout` y `stderr`), todos los formateadores/clasificadores de `messages`/`classifiers` prueban primero `stderr` y, si viene vacío, caen a `stdout`. No hace falta configuración extra — el mismo `describeError`/`classify` que usás hoy funciona aunque el texto vaya por stdout:
 
@@ -1110,7 +1113,115 @@ Si ningún classifier/formatter matchea, se usa el área `"unclassified"` y el m
 | `senders.webhook({ url, format? })` | Como `http`, pero formatea `{ text: "❌ ..." }` por defecto — compatible con Slack/Discord y con **Microsoft Teams** vía Workflows (Power Automate), pasando un `format` que arme el payload de Adaptive Card que Teams espera |
 | `senders.websocket({ url, timeout? })` | Abre una conexión WS, manda el evento como JSON y cierra. Requiere Node ≥21 (usa el `WebSocket` global) |
 
-Podés escribir tu propio sender: es cualquier función `(event) => void | Promise<void>` — recibe `{ type, taskId, area?, error?, result?, message, timestamp }`.
+Podés escribir tu propio sender: es cualquier función `(event) => void | Promise<void>` — recibe `{ type, taskId, area?, error?, result?, message, timestamp, service?, method?, args? }`.
+
+Los campos `service`, `method` y `args` solo están presentes cuando el error viene de `ctx.wrap()` (un `ServiceError`).
+
+## Notificaciones de servicios: `ctx.wrap()`
+
+`ctx.wrap(service, serviceName)` envuelve un objeto de servicio en un **Proxy** que intercepta cada llamada a método. Si el método falla, el error se envuelve automáticamente en un `ServiceError` con metadata del servicio y se despacha al `ctx.notifier` antes de re-lanzarlo.
+
+### Uso básico
+
+```typescript
+// Envolver servicios que quieras monitorear
+const docker = ctx.wrap(ctx.services.docker, "docker");
+const kubectl = ctx.wrap(ctx.services.kubectl, "kubectl");
+
+// Configurar classifiers y canales (igual que siempre)
+ctx.notifier
+    .classify(classifiers.byCommand({ docker: "containers", kubectl: "kubernetes" }))
+    .classify(classifiers.byService({ docker: "containers", kubectl: "kubernetes" }))
+    .channel("containers", senders.webhook({ url: process.env.SLACK_WEBHOOK }))
+    .channel("kubernetes", senders.webhook({ url: process.env.TEAMS_WEBHOOK }));
+
+// Cualquier fallo auto-notifica con contexto completo
+await docker.push("myimage:latest");
+// → taskId: 'docker.push("myimage:latest")'
+// → error: ServiceError { service: "docker", method: "push", args: ["myimage:latest"], cause: ExecResult }
+```
+
+### Qué information llega al sender
+
+Cuando `ctx.wrap()` captura un error, el `NotificationEvent` incluye:
+
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `taskId` | `string` | Nombre generado: `service.method(args serializados)`, ej. `docker.push("myimage:latest")` |
+| `service` | `string` | Nombre del servicio: `"docker"`, `"kubectl"`, `"http"`, etc. |
+| `method` | `string` | Método que falló: `"push"`, `"apply"`, `"request"`, etc. |
+| `args` | `unknown[]` | Argumentos originales pasados al método |
+| `error` | `ServiceError` | El error completo (`.cause` contiene el error original) |
+| `area` | `string` | Área de TI resuelta por los classifiers |
+| `message` | `string` | Mensaje resuelto por los formatters, o `ServiceError.message` |
+
+### ServiceError
+
+`ServiceError` extiende `Error` y contiene:
+
+```typescript
+class ServiceError extends Error {
+    readonly service: string;   // "docker", "http", etc.
+    readonly method: string;    // "push", "request", etc.
+    readonly args: unknown[];   // argumentos originales
+    readonly cause: unknown;    // error original (ExecResult, HttpError, Error, etc.)
+}
+```
+
+La propiedad `cause` contiene el error original — los classifiers y formatters existentes (`byCommand`, `byPattern`, `byRule`) unwrappean `ServiceError.cause` automáticamente, así que la configuración que ya tenés sigue funcionando sin cambios.
+
+### Combinación con classifiers existentes
+
+`byCommand` y `byPattern` unwrappean `ServiceError.cause` automáticamente. Esto significa que un `docker.push()` que falla con un error de shell (que tiene `command: "docker"`) se clasifica correctamente vía `byCommand`, y un `http.request()` que falla con un `status: 504` se clasifica vía `byPattern`:
+
+```typescript
+ctx.notifier
+    // byCommand unwrappea ServiceError.cause.command → "docker" → "containers"
+    .classify(classifiers.byCommand({ docker: "containers", kubectl: "kubernetes" }))
+
+    // byPattern unwrappea ServiceError.cause.stderr → /permission denied/ → "security"
+    .classify(classifiers.byPattern([
+        [/permission denied|unauthorized/i, "security"],
+        [/timeout|ECONNREFUSED/i, "networking"]
+    ]))
+
+    // byService matchea directamente ServiceError.service → "http" → "networking"
+    .classify(classifiers.byService({ http: "networking" }))
+```
+
+El orden importa: el primer classifier que matchea gana. Usá `byCommand`/`byPattern` primero (más específico) y `byService` como fallback.
+
+### Mensajes personalizados para servicios
+
+```typescript
+ctx.notifier
+    // byService: mensaje fijo por nombre de servicio
+    .describeError(messages.byService({
+        docker: "Falló una operación de Docker, revisa el build/push del registry",
+        http: "Falló una petición HTTP, revisa la conectividad"
+    }))
+
+    // byRule unwrappea ServiceError.cause → distingue por comando + args + patrón
+    .describeError(messages.byRule([
+        {
+            command: "docker", args: "push", pattern: /500 Internal Server Error/,
+            message: "Falta espacio en el registry"
+        },
+        {
+            command: "kubectl", pattern: /500/,
+            message: "El API server de Kubernetes devolvió 500"
+        }
+    ]));
+```
+
+### Propiedades no-función pasan sin proxy
+
+El Proxy solo intercepta llamadas a métodos. Las propiedades que no son funciones (strings, números, objetos) pasan directamente:
+
+```typescript
+const docker = ctx.wrap(ctx.services.docker, "docker");
+docker.version; // pasa directo, sin proxy
+```
 
 ## Tests
 
@@ -1133,6 +1244,7 @@ npm test
 - `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)
 - `azdo-api.test.js` — AzureDevOpsApi contra mock server: proyectos, repos, branches, commits, PRs, builds, pipelines, work items, overrides
 - `pipeline.test.js` — Pipeline motor: stages/jobs/tasks, dependencias cross-level con paths dotted, resultados jerárquicos (stage.job.task), fluent API, registry, reset, ctx access, detección de tipo por propiedad, PipelineResultsAccessor
+- `service-notify.test.js` — ServiceError, ctx.wrap(), Notifier con service/method/args, classifiers.byService/messages.byService, unwrap de ServiceError en byCommand/byPattern/byRule, integración completa, backward compat
 
 ## Siguientes pasos posibles
 

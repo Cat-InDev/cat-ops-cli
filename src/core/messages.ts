@@ -1,5 +1,6 @@
 import type { Context } from "./Context";
 import type { ErrorMessageFormatter } from "./types";
+import { ServiceError } from "./types";
 
 interface ExecLikeError {
     command?: string;
@@ -9,7 +10,18 @@ interface ExecLikeError {
     message?: string;
 }
 
+function unwrapExecLike(error: unknown): ExecLikeError {
+    if (error instanceof ServiceError && error.cause) {
+        return error.cause as ExecLikeError;
+    }
+    return error as ExecLikeError;
+}
+
 function textOf(error: unknown): string {
+    if (error instanceof ServiceError && error.cause) {
+        const cause = error.cause as ExecLikeError;
+        return cause.stderr || cause.stdout || cause.message || String(error.cause);
+    }
     const execError = error as ExecLikeError;
     return execError?.stderr || execError?.stdout || execError?.message || String(error);
 }
@@ -65,7 +77,8 @@ export function byCommand(map: Record<string, string>): ErrorMessageFormatter {
 
     return (error: unknown) => {
 
-        const command = (error as ExecLikeError)?.command;
+        const execError = unwrapExecLike(error);
+        const command = execError?.command;
 
         if (!command) return undefined;
 
@@ -170,7 +183,7 @@ export function byRule(rules: MessageRule[]): ErrorMessageFormatter {
 
     return (error: unknown, ctx: Context) => {
 
-        const execError = error as ExecLikeError;
+        const execError = unwrapExecLike(error);
         const text = textOf(error);
 
         for (const rule of rules) {
@@ -185,6 +198,31 @@ export function byRule(rules: MessageRule[]): ErrorMessageFormatter {
                     : rule.message;
             }
 
+        }
+
+        return undefined;
+
+    };
+
+}
+
+/**
+ * Formateador de fábrica: mapea el nombre del servicio que falló a un
+ * mensaje genérico fijo. Funciona con errores envueltos por `ctx.wrap()`
+ * (ServiceError).
+ *
+ * Ejemplo:
+ *   notifier.describeError(messages.byService({
+ *       docker: "Falló una operación de Docker, revisa el build/push del registry",
+ *       http: "Falló una petición HTTP, revisa la conectividad"
+ *   }));
+ */
+export function byService(map: Record<string, string>): ErrorMessageFormatter {
+
+    return (error: unknown) => {
+
+        if (error instanceof ServiceError) {
+            return map[error.service];
         }
 
         return undefined;

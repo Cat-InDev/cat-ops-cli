@@ -4,6 +4,7 @@ import { services, type ServicesRegistry } from "../services";
 import { Notifier } from "./Notifier";
 import type { AskOptions, ConfirmOptions, SelectChoices } from "./prompt";
 import type { TaskHooks } from "./types";
+import { ServiceError } from "./types";
 
 export type FlagValue = boolean | string;
 
@@ -98,6 +99,43 @@ export class Context {
 
         }
 
+    }
+
+    /**
+     * Envuelve un objeto de servicio (o cualquier objeto con métodos) en un
+     * Proxy que intercepta cada llamada a método. Si el método lanza un error,
+     * lo envuelve en un `ServiceError` con metadata del servicio (nombre,
+     * método, argumentos) y lo despacha al notifier antes de re-lanzarlo.
+     *
+     * Ejemplo:
+     *   const docker = ctx.wrap(ctx.services.docker, "docker");
+     *   await docker.push("myimage:latest");
+     *   // Si falla, el notifier recibe:
+     *   //   taskId: 'docker.push("myimage:latest")'
+     *   //   error: ServiceError { service: "docker", method: "push", args: [...], cause: ExecResult }
+     */
+    wrap<T extends Record<string, (...args: any[]) => any>>(service: T, serviceName: string): T {
+        const ctx = this;
+        return new Proxy(service, {
+            get(target, prop, receiver) {
+                const original = Reflect.get(target, prop, receiver);
+                if (typeof original !== "function") return original;
+                return async function (this: unknown, ...args: unknown[]) {
+                    try {
+                        return await original.apply(target, args);
+                    } catch (error) {
+                        const methodName = String(prop);
+                        const serializedArgs = args.map(a => {
+                            try { return JSON.stringify(a); } catch { return String(a); }
+                        }).join(", ");
+                        const taskId = `${serviceName}.${methodName}(${serializedArgs})`;
+                        const wrapped = new ServiceError(serviceName, methodName, args, error);
+                        await ctx.notifier.reportError(taskId, wrapped, ctx);
+                        throw wrapped;
+                    }
+                };
+            }
+        });
     }
 
     // ---- prompts ----

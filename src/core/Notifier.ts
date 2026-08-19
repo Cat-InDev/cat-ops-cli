@@ -1,9 +1,14 @@
 import type { Context } from "./Context";
 import type { ErrorClassifier, ErrorMessageFormatter, NotificationEvent, Sender } from "./types";
+import { ServiceError } from "./types";
 
 const WILDCARD = "*";
 
 function toMessage(error: unknown): string {
+
+    if (error instanceof ServiceError) {
+        return error.message;
+    }
 
     if (error instanceof Error) {
         return error.message;
@@ -135,13 +140,20 @@ export class Notifier {
             ...(area !== WILDCARD ? this.channels.get(WILDCARD) ?? [] : [])
         ];
 
+        const serviceError = error instanceof ServiceError ? error : undefined;
+
         const event: NotificationEvent = {
             type: "error",
             taskId,
             area,
             error,
             message: this.resolveMessage(error, ctx),
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            ...(serviceError ? {
+                service: serviceError.service,
+                method: serviceError.method,
+                args: serviceError.args
+            } : {})
         };
 
         await Promise.allSettled(

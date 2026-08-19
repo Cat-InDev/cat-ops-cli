@@ -73,3 +73,5 @@ export type {
     ErrorMessageFormatter,
     Sender
 } from "./core/types";
+
+export { ServiceError } from "./core/types";
