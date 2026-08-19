@@ -5,7 +5,7 @@ Framework para pipelines DevOps, escrito en **TypeScript** (100% usable desde Ja
 Trae:
 
 - Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
-- **15 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`).
+- **15 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`) + un **motor de pipelines** declarativo con dependencias (`Pipeline`).
 - **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout.
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
 - **retry / timeout / dryRun** en cada comando de shell.
@@ -89,18 +89,18 @@ src/
     http.ts           -> cliente HTTP con interceptores de request/response, múltiples instancias
     http-types.ts     -> tipos del servicio HTTP (HttpRequest, HttpResponse, interceptors, ...)
     docker.ts, git.ts, kubectl.ts, helm.ts, npm.ts, archive.ts
-    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts,     az.ts, azdo.ts, azdo-api.ts
+    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts,     az.ts, azdo.ts, azdo-api.ts, pipeline.ts
     index.ts           -> registra todos los servicios anteriores (ServicesRegistry)
   index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, http, tipos
   bin/
-    catops-cli.ts      -> CLI ejecutable (busca devops.pipeline.js en el proyecto consumidor)
+    devops-cli.ts      -> CLI ejecutable (busca devops.pipeline.js en el proyecto consumidor)
 examples/
   pipeline-example.js  -> pipeline + menú + notificaciones de ejemplo, corre contra dist/
 test/
   context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
   notifier.test.js, senders.test.js, hooks-integration.test.js,
   http.test.js, kubectl.test.js, oc.test.js, deployment-group.test.js,
-  exec-options-passthrough.test.js, azdo-api.test.js
+  exec-options-passthrough.test.js, azdo-api.test.js, pipeline.test.js
 ```
 
 ## Uso rápido: menú con `devops.pipeline.js` + el bin
@@ -524,7 +524,267 @@ await azdo.listRepos({ exec: { dryRun: true } });
 
 Los tipos de respuesta completos (`AzdoProject`, `AzdoGitRepository`, `AzdoBuild`, etc.) se exportan desde la raíz del paquete para tipado en TypeScript.
 
-## Servicio HTTP con interceptores (`ctx.services.http`)
+## Motor de pipelines declarativo (`ctx.services.pipeline`)
+
+Un motor de ejecución de pipelines con **stages → jobs → tasks**, dependencias entre entidades, acceso a resultados jerárquico por contexto (`stage.job.task`), tipos de task extensibles, y registro global de pipelines reutilizables.
+
+### Estructura flexible
+
+La estructura es **completamente opcional en cada nivel** — podés definir un pipeline con stages completos, solo jobs, o solo tasks:
+
+```javascript
+// Pipeline completo: stages → jobs → tasks
+const fullPipeline = new Pipeline("deploy");
+fullPipeline
+    .stage("build")
+        .job("compile")
+            .task("install-deps", { exec: async (ctx) => { /* ... */ } })
+            .task("compile", { exec: async (ctx) => { /* ... */ } })
+    .stage("test")
+        .job("unit-tests")
+            .task("run-tests", { exec: async (ctx) => { /* ... */ } })
+    .stage("deploy")
+        .job("push")
+            .task("upload", { exec: async (ctx, results) => { /* results.build.compile */ }, depends: ["build.compile"] });
+
+await fullPipeline.run(ctx);
+```
+
+```javascript
+// Solo tasks (sin stages ni jobs) — acceso flat dentro del mismo job
+const simple = new Pipeline("simple", {
+    tasks: {
+        build: { exec: async (ctx) => { await ctx.services.docker.build({...}); } },
+        test:  { exec: async (ctx) => { await ctx.services.shell.exec("npm", "test"); } },
+        push:  { exec: async (ctx, results) => { await ctx.services.docker.push({...}); }, depends: ["build"] }
+    }
+});
+await simple.run(ctx);
+```
+
+```javascript
+// Solo jobs (sin stages)
+const jobsOnly = new Pipeline("ci", {
+    jobs: {
+        build: { tasks: { compile: { exec: () => "ok" } } },
+        test:  { tasks: { unit: { exec: () => "pass" } } }
+    }
+});
+await jobsOnly.run(ctx);
+```
+
+### Dependencias
+
+Cada task, job, o stage puede declarar `depends: ["nombre"]` — el motor resuelve el orden automáticamente:
+
+```javascript
+const pipeline = new Pipeline("ordered");
+pipeline
+    .stage("build")
+        .job("compile")
+            .task("install", { exec: () => "deps installed" })
+            .task("compile", { exec: () => "compiled", depends: ["install"] })
+    .stage("test")
+        .job("unit")
+            .task("test", {
+                exec: (_, results) => `testing ${results.build.compile.compile}`,
+                depends: ["build.compile.compile"]   // cross-stage: stage.job.task
+            })
+    .stage("deploy")
+        .job("push")
+            .task("upload", {
+                exec: (_, results) => `deployed ${results.unit.test}`,
+                depends: ["unit.test"]               // cross-job mismo stage: job.task
+            });
+
+await pipeline.run(ctx);
+```
+
+Las dependencias son **cross-level** — una task en un stage puede depender de una task de otro stage usando paths con dot notation:
+
+```javascript
+// Cross-stage: deploy necesita un resultado de build
+.task("upload", {
+    exec: (_, results) => `uploaded ${results.build.compile.artifact}`,
+    depends: ["build.compile.artifact"]   // stage.job.task
+})
+
+// Cross-job mismo stage: test necesita algo de build
+.task("verify", {
+    exec: (_, results) => `verified ${results.compile.output}`,
+    depends: ["compile.output"]           // job.task
+})
+
+// Mismo job: dependencia directa por nombre
+.task("deploy", {
+    exec: (_, results) => `deploy-${results.build}`,
+    depends: ["build"]                    // task (flat)
+})
+```
+
+Los stages y jobs se ejecutan en **orden secuencial por defecto** (definition order).
+
+### Acceso a resultados
+
+Los resultados se organizan jerárquicamente: `stage → job → task`. Cada callback recibe `(ctx, results)` donde `results` es un proxy que resuelve por contexto:
+
+```javascript
+pipeline
+    .stage("build")
+        .job("compile")
+            .task("compile", { exec: () => "artifact-v1" })
+    .stage("deploy")
+        .job("push")
+            .task("upload", {
+                exec: (_, results) => {
+                    // Mismo job: acceso directo por nombre de task
+                    // results.myTask = "valor"
+
+                    // Mismo stage, otro job: job.task
+                    // results.compile.compile = "artifact-v1"
+
+                    // Otro stage: stage.job.task
+                    // results.build.compile = { compile: "artifact-v1" }
+
+                    return `uploaded ${results.build.compile.compile}`;
+                },
+                depends: ["build.compile.compile"]
+            });
+```
+
+**Reglas de resolución:**
+
+| Contexto | Sintaxis | Ejemplo |
+|---|---|---|
+| Misma task (otro task en el mismo job) | `results.<task>` | `results.build` |
+| Mismo stage, otro job | `results.<job>.<task>` | `results.compile.output` |
+| Otro stage | `results.<stage>.<job>.<task>` | `results.build.compile.artifact` |
+
+El proxy intenta resolver en este orden: flat → job path → stage path. El primer match gana.
+
+Cada entidad también expone sus resultados vía `.results` (PipelineTask), `.results` (PipelineJob — mapa anidado), y `.getResults()` (PipelineStage/Pipeline).
+
+### Registry global de pipelines
+
+`ctx.services.pipeline` es un registry — definís pipelines al inicio y los ejecutás por nombre:
+
+```javascript
+// Definir pipelines globales
+ctx.services.pipeline.define("build-and-test", {
+    tasks: {
+        build: { exec: async (ctx) => { await ctx.services.docker.build({...}); } },
+        test:  { exec: async (ctx) => { await ctx.services.shell.exec("npm", "test"); } }
+    }
+});
+
+ctx.services.pipeline.define("deploy-prod", {
+    stages: {
+        build: { jobs: { compile: { tasks: { step: { exec: async (ctx) => { /* ... */ } } } } } },
+        deploy: { jobs: { push: { tasks: { step: { exec: async (ctx) => { /* ... */ } } } } } }
+    }
+});
+
+// Ejecutar por nombre
+await ctx.services.pipeline.run("build-and-test", ctx);
+await ctx.services.pipeline.run("deploy-prod", ctx);
+```
+
+**Gestión de pipelines:**
+
+```javascript
+// Listar todos los pipelines registrados
+ctx.services.pipeline.list();  // ["build-and-test", "deploy-prod"]
+
+// Obtener un pipeline para modificarlo
+const p = ctx.services.pipeline.get("build-and-test");
+
+// Eliminar un pipeline
+ctx.services.pipeline.remove("deploy-prod");
+```
+
+### Context access
+
+Cada task recibe `ctx` como primer argumento — acceso completo a servicios, flags, params, logger, etc.:
+
+```javascript
+pipeline.stage("build").job("compile").task("step1", {
+    exec: async (ctx) => {
+        ctx.logger.info(`Building with env: ${ctx.params.env}`);
+        await ctx.services.docker.build({ image: `app:${ctx.params.version}` });
+        ctx.set("image", `app:${ctx.params.version}`);
+    }
+});
+```
+
+### PipelineRunResult
+
+`pipeline.run()` devuelve un objeto con status, results (jerárquico), error, y duration:
+
+```javascript
+const result = await pipeline.run(ctx);
+
+if (result.status === "success") {
+    ctx.logger.success(`Pipeline completed in ${result.duration}ms`);
+    console.log(result.results);
+    // {
+    //     build: {                        // stage
+    //         compile: {                  // job
+    //             step1: "compiled"       // task
+    //         }
+    //     },
+    //     deploy: {
+    //         push: {
+    //             upload: "uploaded-v1"
+    //         }
+    //     }
+    // }
+} else {
+    ctx.logger.error(`Pipeline failed: ${result.error.message}`);
+}
+```
+
+### Task types
+
+El tipo de ejecución se determina por la **propiedad** presente en la config. No hay campo `type` — la propiedad misma es el tipo:
+
+```javascript
+// exec = callback (único type actualmente)
+.task("compile", {
+    exec: async (ctx, results) => { /* ... */ }
+})
+```
+
+Para agregar un nuevo tipo en el futuro, solo se agrega la propiedad al config y el case en `_execute`:
+
+```javascript
+// Futuro: shell
+.task("test", {
+    shell: { command: "npm", args: ["test"] }
+})
+
+// Futuro: docker
+.task("build", {
+    docker: { action: "build", image: "app:v1" }
+})
+```
+
+El engine detecta `"exec" in config`, `"shell" in config`, etc. y ejecuta la estrategia correspondiente.
+
+### Reset y reutilización
+
+Los pipelines son reutilizables — `reset()` restaura el estado de todas las entidades:
+
+```javascript
+const pipeline = new Pipeline("reusable", {
+    tasks: { step: { exec: () => ++count } }
+});
+
+await pipeline.run(ctx);  // count = 1
+pipeline.reset();
+await pipeline.run(ctx);  // count = 2
+```
+
+### Servicio HTTP con interceptores (`ctx.services.http`)
 
 Un cliente HTTP completo con soporte para **interceptors de request y response**, configurable como servicio global o como instancias independientes.
 
@@ -872,6 +1132,7 @@ npm test
 - `exec-options-passthrough.test.js` — retry/timeout/dryRun (`exec`) llegando a todos los servicios, incluyendo un retry real que se recupera tras 2 fallos
 - `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)
 - `azdo-api.test.js` — AzureDevOpsApi contra mock server: proyectos, repos, branches, commits, PRs, builds, pipelines, work items, overrides
+- `pipeline.test.js` — Pipeline motor: stages/jobs/tasks, dependencias cross-level con paths dotted, resultados jerárquicos (stage.job.task), fluent API, registry, reset, ctx access, detección de tipo por propiedad, PipelineResultsAccessor
 
 ## Siguientes pasos posibles
 

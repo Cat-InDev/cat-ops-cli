@@ -13,7 +13,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "catops-cli": "./dist/bin/catops-cli.js"
+    "catops-cli": "./dist/bin/devops-cli.js"
   },
   "files": [
     "dist",
@@ -41,7 +41,7 @@
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
     "example": "npm run build && node examples/pipeline-example.js",
-    "start": "node dist/bin/catops-cli.js",
+    "start": "node dist/bin/devops-cli.js",
     "pretest": "npm run build",
     "test": "node --test",
     "prepublishOnly": "npm run build && npm test",

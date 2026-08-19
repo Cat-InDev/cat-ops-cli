@@ -13,6 +13,7 @@ import * as oc from "./oc";
 import * as az from "./az";
 import * as azdo from "./azdo";
 import * as http from "./http";
+import { PipelineRegistry } from "./pipeline";
 
 export const services = {
     shell,
@@ -29,7 +30,8 @@ export const services = {
     oc,
     az,
     azdo,
-    http
+    http,
+    pipeline: new PipelineRegistry()
 };
 
 export type ServicesRegistry = typeof services;
@@ -51,3 +53,5 @@ export {
     azdo,
     http
 };
+
+export { PipelineRegistry } from "./pipeline";

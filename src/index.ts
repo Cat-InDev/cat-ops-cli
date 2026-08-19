@@ -11,6 +11,18 @@ export * as prompt from "./core/prompt";
 export { services } from "./services";
 export type { ServicesRegistry } from "./services";
 
+export { PipelineRegistry, Pipeline, PipelineStage, PipelineJob, PipelineTask, PipelineResultsAccessor } from "./services/pipeline";
+export type {
+    PipelineConfig,
+    PipelineStageConfig,
+    PipelineJobConfig,
+    PipelineTaskConfig,
+    PipelineTaskBase,
+    CallbackTaskConfig,
+    PipelineRunResult,
+    PipelineEntityStatus
+} from "./services/pipeline";
+
 export { http, HttpService, HttpRegistry } from "./services/http";
 export type {
     HttpMethod,

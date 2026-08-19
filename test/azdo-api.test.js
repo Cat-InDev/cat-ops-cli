@@ -88,20 +88,20 @@ test("envía Authorization Basic con PAT codificado en base64", async () => {
 
     let receivedAuth = null;
 
-    const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories": () => ({ count: 0, value: [] })
+    const server = http.createServer((req, res) => {
+        receivedAuth = req.headers["authorization"];
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ count: 0, value: [] }));
     });
+
+    await new Promise((resolve) => server.listen(0, resolve));
+    const url = `http://localhost:${server.address().port}`;
 
     const api = createApi(url);
     await api.listRepos();
 
-    // El PAT "test-pat-token" se codifica como :test-pat-token en base64
-    const expected = Buffer.from(":test-pat-token").toString("base64");
-
-    // Verificamos que el agente recibe los headers correctos
-    // (el server mock no tiene acceso a los headers request del fetch,
-    //  así que verificamos indirectamente que la llamada fue exitosa)
-    assert.ok(true);
+    const expected = `Basic ${Buffer.from(":test-pat-token").toString("base64")}`;
+    assert.equal(receivedAuth, expected);
 
     await closeServer(server);
 
