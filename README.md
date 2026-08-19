@@ -5,7 +5,7 @@ Framework para pipelines DevOps, escrito en **TypeScript** (100% usable desde Ja
 Trae:
 
 - Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
-- **15 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`).
+- **15 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`).
 - **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout.
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
 - **retry / timeout / dryRun** en cada comando de shell.
@@ -89,7 +89,7 @@ src/
     http.ts           -> cliente HTTP con interceptores de request/response, múltiples instancias
     http-types.ts     -> tipos del servicio HTTP (HttpRequest, HttpResponse, interceptors, ...)
     docker.ts, git.ts, kubectl.ts, helm.ts, npm.ts, archive.ts
-    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts, az.ts, azdo.ts
+    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts,     az.ts, azdo.ts, azdo-api.ts
     index.ts           -> registra todos los servicios anteriores (ServicesRegistry)
   index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, http, tipos
   bin/
@@ -100,7 +100,7 @@ test/
   context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
   notifier.test.js, senders.test.js, hooks-integration.test.js,
   http.test.js, kubectl.test.js, oc.test.js, deployment-group.test.js,
-  exec-options-passthrough.test.js
+  exec-options-passthrough.test.js, azdo-api.test.js
 ```
 
 ## Uso rápido: menú con `devops.pipeline.js` + el bin
@@ -398,6 +398,131 @@ ctx.services.azdo.group("Build");
 // ... pasos ...
 ctx.services.azdo.endGroup();
 ```
+
+## Cliente HTTP de Azure DevOps REST API (`AzureDevOpsApi`)
+
+Un cliente tipado para la REST API de Azure DevOps (Repos, Builds, Pipelines, Work Items). Usa autenticación Basic con PAT, project-level por defecto, y soporta overrides por llamada.
+
+### Configuración
+
+```typescript
+import { AzureDevOpsApi } from "catops-cli";
+
+const azdo = new AzureDevOpsApi().configure({
+    baseUrl: "https://dev.azure.com/miorg",
+    pat: process.env.AZDO_PAT,
+    project: "mi-proyecto",         // project por defecto (opcional)
+    apiVersion: "7.1",              // default
+});
+```
+
+Se puede pasar un agente HTTP existente con `agent` para reusar interceptores/configuración:
+
+```typescript
+const azdo = new AzureDevOpsApi().configure({
+    baseUrl: "https://dev.azure.com/miorg",
+    pat: process.env.AZDO_PAT,
+    agent: ctx.services.http.agent("azdo")  // o un HttpService nuevo
+});
+```
+
+### Proyectos
+
+```typescript
+const res = await azdo.listProjects();
+const proj = await azdo.getProject("mi-proyecto");
+```
+
+### Git Repos
+
+```typescript
+const repos = await azdo.listRepos();
+const repo  = await azdo.getRepo("frontend");
+```
+
+### Branches
+
+```typescript
+const branches = await azdo.listBranches("frontend");
+
+const exists = await azdo.branchExists("frontend", "feature/login");  // true | false
+
+const branch = await azdo.getBranch("frontend", "feature/login");
+// → branch.body.aheadCount, .behindCount, .commit.commitId, ...
+```
+
+### Commits
+
+```typescript
+const commits = await azdo.listCommits("frontend", { branch: "main", top: 10 });
+const commit  = await azdo.getCommit("frontend", "abc123");
+```
+
+### Pull Requests
+
+```typescript
+const prs  = await azdo.listPullRequests("frontend", { status: "active" });
+const pr   = await azdo.getPullRequest("frontend", 42);
+const newPr = await azdo.createPullRequest("frontend", {
+    sourceRefName: "refs/heads/feature/login",
+    targetRefName: "refs/heads/main",
+    title: "feat: login",
+    description: "Agrega pantalla de login"
+});
+```
+
+### Build Definitions & Builds
+
+```typescript
+const defs = await azdo.listBuildDefinitions();
+const def  = await azdo.getBuildDefinition(1);
+
+const builds = await azdo.listBuilds({ definitionId: 5, top: 10 });
+const build  = await azdo.getBuild(100);
+
+const queued = await azdo.queueBuild(5, { branch: "main", parameters: { config: "Release" } });
+// → queued.body.id, .status, .buildNumber
+```
+
+### Pipelines
+
+```typescript
+const pipelines = await azdo.listPipelines();
+const pipeline  = await azdo.getPipeline(10);
+
+const run = await azdo.runPipeline(10, {
+    branch: "main",
+    variables: { ENV: { value: "production" } }
+});
+```
+
+### Work Items
+
+```typescript
+const wi = await azdo.getWorkItem(123, { fields: ["System.Title", "System.State"] });
+
+const query = await azdo.queryWorkItems(
+    "SELECT [System.Id] FROM WorkItems WHERE [System.State] = 'Active'"
+);
+// → query.body.workItems → [{ id, url }, ...]
+```
+
+### Overrides por llamada
+
+Cada método acepta un objeto de opciones con `project`, `apiVersion`, `query`, y `exec`:
+
+```typescript
+// project override → usa otro proyecto solo para esta llamada
+await azdo.listRepos({ project: "otro-proyecto" });
+
+// organization-level → omite el project de la URL
+await azdo.listProjects({ organizationLevel: true });
+
+// dry-run — solo loguea la petición HTTP sin enviarla
+await azdo.listRepos({ exec: { dryRun: true } });
+```
+
+Los tipos de respuesta completos (`AzdoProject`, `AzdoGitRepository`, `AzdoBuild`, etc.) se exportan desde la raíz del paquete para tipado en TypeScript.
 
 ## Servicio HTTP con interceptores (`ctx.services.http`)
 
@@ -746,6 +871,7 @@ npm test
 - `kubectl.test.js`, `oc.test.js` — kubeconfig/namespace, waitForDeployment (éxito, timeout, Failed, maxRestarts)
 - `exec-options-passthrough.test.js` — retry/timeout/dryRun (`exec`) llegando a todos los servicios, incluyendo un retry real que se recupera tras 2 fallos
 - `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)
+- `azdo-api.test.js` — AzureDevOpsApi contra mock server: proyectos, repos, branches, commits, PRs, builds, pipelines, work items, overrides
 
 ## Siguientes pasos posibles
 
