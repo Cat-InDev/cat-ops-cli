@@ -49,7 +49,19 @@ export type {
     AzdoBuild,
     AzdoPipeline,
     AzdoWorkItem,
-    AzdoListResponse
+    AzdoListResponse,
+    AzdoWebHookSubscription,
+    AzdoEnvironment,
+    AzdoIdentityGroup,
+    AzdoPolicyConfiguration,
+    AzdoAgentPool,
+    AzdoAgentQueue,
+    AzdoVariableGroup,
+    AzdoBuildFolder,
+    AzdoServiceEndpoint,
+    AzdoGitRef,
+    AzdoGitTag,
+    AzdoGitItem
 } from "./services/azdo-api";
 
 export { Notifier } from "./core/Notifier";
