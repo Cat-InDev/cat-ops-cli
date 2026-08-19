@@ -5,7 +5,8 @@ Framework para pipelines DevOps, escrito en **TypeScript** (100% usable desde Ja
 Trae:
 
 - Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
-- **14 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`).
+- **15 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`).
+- **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout.
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
 - **retry / timeout / dryRun** en cada comando de shell.
 - Validación cíclica de rollouts de Kubernetes/OpenShift (`waitForDeployment`, `waitForDeploymentGroup`).
@@ -85,10 +86,12 @@ src/
     types.ts               -> tipos compartidos (MenuDefinition, ExecOptions, NotificationEvent, ...)
   services/
     shell.ts          -> motor base (spawn), con retry/timeout/dryRun
+    http.ts           -> cliente HTTP con interceptores de request/response, múltiples instancias
+    http-types.ts     -> tipos del servicio HTTP (HttpRequest, HttpResponse, interceptors, ...)
     docker.ts, git.ts, kubectl.ts, helm.ts, npm.ts, archive.ts
     terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts, az.ts, azdo.ts
     index.ts           -> registra todos los servicios anteriores (ServicesRegistry)
-  index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, tipos
+  index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, http, tipos
   bin/
     catops-cli.ts      -> CLI ejecutable (busca devops.pipeline.js en el proyecto consumidor)
 examples/
@@ -96,7 +99,8 @@ examples/
 test/
   context.test.js, shell.test.js, services.test.js, menu-selector.test.js,
   notifier.test.js, senders.test.js, hooks-integration.test.js,
-  kubectl.test.js, oc.test.js, deployment-group.test.js, exec-options-passthrough.test.js
+  http.test.js, kubectl.test.js, oc.test.js, deployment-group.test.js,
+  exec-options-passthrough.test.js
 ```
 
 ## Uso rápido: menú con `devops.pipeline.js` + el bin
@@ -395,6 +399,238 @@ ctx.services.azdo.group("Build");
 ctx.services.azdo.endGroup();
 ```
 
+## Servicio HTTP con interceptores (`ctx.services.http`)
+
+Un cliente HTTP completo con soporte para **interceptors de request y response**, configurable como servicio global o como instancias independientes.
+
+### Uso básico
+
+```javascript
+// GET
+const res = await ctx.services.http.get("https://api.example.com/users");
+console.log(res.body);  // { users: [...] }
+
+// POST
+const res = await ctx.services.http.post("https://api.example.com/users", {
+    name: "John",
+    email: "john@example.com"
+});
+
+// PUT / PATCH / DELETE
+await ctx.services.http.put("/users/1", { name: "Jane" });
+await ctx.services.http.patch("/users/1", { email: "new@example.com" });
+await ctx.services.http.delete("/users/1");
+```
+
+### Configuración global
+
+```javascript
+ctx.services.http.configure({
+    baseUrl: "https://api.example.com",
+    defaultHeaders: {
+        "Authorization": `Bearer ${process.env.API_TOKEN}`,
+        "Accept": "application/json"
+    },
+    defaultTimeout: 10000  // 10 segundos
+});
+
+// Ahora las peticiones son relativas
+await ctx.services.http.get("/users");        // -> GET https://api.example.com/users
+await ctx.services.http.post("/users", data); // -> POST https://api.example.com/users
+```
+
+### Query params
+
+```javascript
+await ctx.services.http.get("/search", {
+    query: { q: "hello", page: 1, active: true }
+});
+// -> GET /search?q=hello&page=1&active=true
+```
+
+### Errores HTTP
+
+Las respuestas con status 4xx/5xx lanzan un error con metadata completa:
+
+```javascript
+try {
+    await ctx.services.http.get("/missing");
+} catch (err) {
+    console.log(err.status);    // 404
+    console.log(err.body);      // { error: "not found" }
+    console.log(err.headers);   // { ... }
+    console.log(err.request);   // { url, method, headers, ... }
+}
+```
+
+### Interceptores de request
+
+Los interceptors se ejecutan **antes** de cada petición. Pueden mutar el request (headers, auth, logging) o abortarlo:
+
+```javascript
+// Agregar token de auth a todas las peticiones
+ctx.services.http.addRequestInterceptor((ctx) => {
+    ctx.request.headers["Authorization"] = `Bearer ${process.env.TOKEN}`;
+});
+
+// Logging de cada petición
+ctx.services.http.addRequestInterceptor((ctx) => {
+    console.log(`→ ${ctx.request.method} ${ctx.request.url}`);
+});
+
+// Abortar peticiones a ciertos dominios
+ctx.services.http.addRequestInterceptor((ctx) => {
+    if (ctx.request.url.includes("internal")) {
+        ctx.abort("blocked by policy");
+    }
+});
+```
+
+Los interceptors se ejecutan en orden. Si uno aborta, se lanza un error y no se envía la petición.
+
+### Interceptores de response
+
+Los interceptors se ejecutan **después** de cada respuesta. Pueden transformar el body, loguear, o hacer retry:
+
+```javascript
+// Logging de cada respuesta
+ctx.services.http.addResponseInterceptor((ctx) => {
+    console.log(`← ${ctx.response.status} ${ctx.request.url}`);
+});
+
+// Transformar la respuesta
+ctx.services.http.addResponseInterceptor((ctx) => {
+    if (ctx.response.body?.data) {
+        ctx.response.body = ctx.response.body.data;
+    }
+});
+```
+
+### Gestión de interceptors
+
+```javascript
+// Agregar
+const myInterceptor = (ctx) => { /* ... */ };
+ctx.services.http.addRequestInterceptor(myInterceptor);
+ctx.services.http.addResponseInterceptor(myInterceptor);
+
+// Eliminar uno específico
+ctx.services.http.removeRequestInterceptor(myInterceptor);
+ctx.services.http.removeResponseInterceptor(myInterceptor);
+
+// Limpiar todos
+ctx.services.http.clearRequestInterceptors();
+ctx.services.http.clearResponseInterceptors();
+```
+
+### Agentes HTTP nombrados
+
+`ctx.services.http` es un **registry** que gestiona agentes HTTP. Cada agente tiene su propia configuración, interceptores y defaults aislados.
+
+**Default agent** — directamente en `ctx.services.http`:
+
+```javascript
+await ctx.services.http.get("/users");
+await ctx.services.http.post("/users", data);
+```
+
+**Agentes nombrados** — para APIs distintas con configuración propia:
+
+```javascript
+import { HttpService } from "catops-cli";
+
+// Crear y registrar un agente
+ctx.services.http.createAgent(
+    new HttpService().configure({
+        baseUrl: "https://api.github.com",
+        defaultHeaders: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
+    }),
+    "github"
+);
+
+ctx.services.http.createAgent(
+    new HttpService().configure({
+        baseUrl: "https://internal.mycompany.com/api",
+        defaultHeaders: { "X-API-Key": process.env.INTERNAL_KEY }
+    }),
+    "internal"
+);
+
+// Usar por nombre — cada uno tiene interceptores y config aislados
+await ctx.services.http.agent("github").get("/repos/org/repo");
+await ctx.services.http.agent("internal").get("/services/status");
+```
+
+**Gestión de agentes:**
+
+```javascript
+// Listar todos los agentes registrados
+ctx.services.http.listAgents();  // ["github", "internal"]
+
+// Eliminar un agente
+ctx.services.http.removeAgent("github");
+
+// Reemplazar un agente existente (mismo nombre)
+ctx.services.http.createAgent(new HttpService().configure({...}), "internal");
+```
+
+**Ejemplo completo — interceptores por agente:**
+
+```javascript
+const github = new HttpService()
+    .configure({
+        baseUrl: "https://api.github.com",
+        defaultHeaders: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
+    })
+    .addRequestInterceptor((ctx) => {
+        ctx.request.headers["Accept"] = "application/vnd.github.v3+json";
+    })
+    .addResponseInterceptor((ctx) => {
+        if (ctx.response.body?.data) {
+            ctx.response.body = ctx.response.body.data;
+        }
+    });
+
+const internal = new HttpService()
+    .configure({ baseUrl: "https://internal.mycompany.com/api" })
+    .addRequestInterceptor(async (ctx) => {
+        const token = await fetchTokenFromVault();
+        ctx.request.headers["Authorization"] = `Bearer ${token}`;
+    });
+
+ctx.services.http.createAgent(github, "github");
+ctx.services.http.createAgent(internal, "internal");
+
+// Cada agente usa sus propios interceptores
+await ctx.services.http.agent("github").get("/repos/org/repo");
+await ctx.services.http.agent("internal").get("/services/status");
+```
+
+### Opciones por llamada
+
+```javascript
+await ctx.services.http.get("/slow-endpoint", {
+    timeout: 30000,              // override del default
+    headers: { "X-Request-Id": "123" },
+    query: { includeDeleted: false }
+});
+
+await ctx.services.http.post("/data", payload, {
+    exec: { dryRun: true }       // soporte dry-run
+});
+```
+
+### Interceptors con async/await
+
+Los interceptors soportan operaciones asíncronas (base de datos, llamadas a servicios, etc.):
+
+```javascript
+ctx.services.http.addRequestInterceptor(async (ctx) => {
+    const token = await fetchTokenFromVault();
+    ctx.request.headers["Authorization"] = `Bearer ${token}`;
+});
+```
+
 ## Notificaciones: clasificar errores por área de TI, personalizar el mensaje, y enviarlos
 
 `ctx.notifier` tiene tres responsabilidades independientes:
@@ -506,6 +742,7 @@ npm test
 - `hooks-integration.test.js` — ctx.run() y items de menú con onSuccess/onError
 - `notifier.test.js` — classify/channel/onSuccess/describeError/byRule
 - `senders.test.js` — file/http/webhook/log contra servidores reales en localhost
+- `http.test.js` — servicio HTTP: métodos, headers, query, interceptors, abort, timeout, dryRun, múltiples instancias aisladas
 - `kubectl.test.js`, `oc.test.js` — kubeconfig/namespace, waitForDeployment (éxito, timeout, Failed, maxRestarts)
 - `exec-options-passthrough.test.js` — retry/timeout/dryRun (`exec`) llegando a todos los servicios, incluyendo un retry real que se recupera tras 2 fallos
 - `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)

@@ -11,6 +11,18 @@ export * as prompt from "./core/prompt";
 export { services } from "./services";
 export type { ServicesRegistry } from "./services";
 
+export { http, HttpService, HttpRegistry } from "./services/http";
+export type {
+    HttpMethod,
+    HttpRequest,
+    HttpResponse,
+    HttpServiceConfig,
+    RequestInterceptor,
+    ResponseInterceptor,
+    RequestContext,
+    ResponseContext
+} from "./services/http-types";
+
 export { Notifier } from "./core/Notifier";
 export * as senders from "./core/senders";
 export * as classifiers from "./core/classifiers";

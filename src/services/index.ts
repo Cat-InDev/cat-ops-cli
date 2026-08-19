@@ -12,6 +12,7 @@ import * as tekton from "./tekton";
 import * as oc from "./oc";
 import * as az from "./az";
 import * as azdo from "./azdo";
+import * as http from "./http";
 
 export const services = {
     shell,
@@ -27,7 +28,8 @@ export const services = {
     tekton,
     oc,
     az,
-    azdo
+    azdo,
+    http
 };
 
 export type ServicesRegistry = typeof services;
@@ -46,5 +48,6 @@ export {
     tekton,
     oc,
     az,
-    azdo
+    azdo,
+    http
 };
