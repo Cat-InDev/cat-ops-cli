@@ -1,11 +1,19 @@
-import type { HttpRequest, HttpResponse } from "./http-types";
+import type { HttpRequest, HttpResponse, RequestInterceptor, ResponseInterceptor } from "./http-types";
 import type { ExecOptions } from "../core/types";
 import { HttpService } from "./http";
+import { toAzdoApiError } from "./azdo-errors";
 
-// Re-export the HttpService type for configure()
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+// Agente HTTP usable por AzureDevOpsApi. Además de `request`, puede exponer
+// los métodos de interceptores de HttpService — si no los expone (agente
+// custom minimalista), no se podrán registrar interceptores sobre él.
 interface HttpAgent {
     request<T = unknown>(req: HttpRequest): Promise<HttpResponse<T>>;
+    addRequestInterceptor?(interceptor: RequestInterceptor): unknown;
+    removeRequestInterceptor?(interceptor: RequestInterceptor): unknown;
+    clearRequestInterceptors?(): unknown;
+    addResponseInterceptor?(interceptor: ResponseInterceptor): unknown;
+    removeResponseInterceptor?(interceptor: ResponseInterceptor): unknown;
+    clearResponseInterceptors?(): unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -23,6 +31,17 @@ export interface AzureDevOpsApiConfig {
     apiVersion?: string;
     /** Agent HTTP a usar para las peticiones. Si no se pasa, se crea uno interno. */
     agent?: HttpAgent;
+    /**
+     * Interceptores de request que se registran en el agente HTTP
+     * (interno o inyectado, siempre que lo soporte). Útiles para tracing,
+     * headers extra, métricas, etc. Se ejecutan ANTES de enviar cada petición.
+     */
+    requestInterceptors?: RequestInterceptor[];
+    /**
+     * Interceptores de response que se registran en el agente HTTP.
+     * Se ejecutan DESPUÉS de recibir cada respuesta (incluye errores HTTP).
+     */
+    responseInterceptors?: ResponseInterceptor[];
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +276,9 @@ export class AzureDevOpsApi {
     private apiVersion = "7.1";
     private agent: HttpAgent | null = null;
     private ownAgent = false;
+    /** Interceptores en cola mientras el agente (perezoso) aún no existe. */
+    private pendingRequestInterceptors: RequestInterceptor[] = [];
+    private pendingResponseInterceptors: ResponseInterceptor[] = [];
 
     configure(config: AzureDevOpsApiConfig): this {
         this.baseUrl = config.baseUrl.replace(/\/+$/, "");
@@ -267,7 +289,115 @@ export class AzureDevOpsApi {
             this.agent = config.agent;
             this.ownAgent = false;
         }
+        // Los interceptores se aplican al agente activo, o quedan en cola si
+        // el agente interno todavía no se ha creado.
+        for (const i of config.requestInterceptors ?? []) this.addRequestInterceptor(i);
+        for (const i of config.responseInterceptors ?? []) this.addResponseInterceptor(i);
         return this;
+    }
+
+    // ---- interceptores del agente HTTP ----
+
+    /**
+     * Registra un interceptor de request en el agente HTTP. Si el agente
+     * interno aún no existe, queda en cola y se aplica al crearlo.
+     */
+    addRequestInterceptor(interceptor: RequestInterceptor): this {
+        if (this.agent) {
+            this.requireAgentMethod("addRequestInterceptor");
+            this.agent.addRequestInterceptor!(interceptor);
+        } else {
+            this.pendingRequestInterceptors.push(interceptor);
+        }
+        return this;
+    }
+
+    /** Elimina un interceptor de request (de la cola o del agente activo). */
+    removeRequestInterceptor(interceptor: RequestInterceptor): this {
+        const idx = this.pendingRequestInterceptors.indexOf(interceptor);
+        if (idx !== -1) {
+            this.pendingRequestInterceptors.splice(idx, 1);
+            return this;
+        }
+        if (this.agent) {
+            this.requireAgentMethod("removeRequestInterceptor");
+            this.agent.removeRequestInterceptor!(interceptor);
+        }
+        return this;
+    }
+
+    /** Elimina todos los interceptores de request (cola + agente activo). */
+    clearRequestInterceptors(): this {
+        this.pendingRequestInterceptors = [];
+        if (this.agent) {
+            this.requireAgentMethod("clearRequestInterceptors");
+            this.agent.clearRequestInterceptors!();
+        }
+        return this;
+    }
+
+    /**
+     * Registra un interceptor de response en el agente HTTP. Si el agente
+     * interno aún no existe, queda en cola y se aplica al crearlo.
+     */
+    addResponseInterceptor(interceptor: ResponseInterceptor): this {
+        if (this.agent) {
+            this.requireAgentMethod("addResponseInterceptor");
+            this.agent.addResponseInterceptor!(interceptor);
+        } else {
+            this.pendingResponseInterceptors.push(interceptor);
+        }
+        return this;
+    }
+
+    /** Elimina un interceptor de response (de la cola o del agente activo). */
+    removeResponseInterceptor(interceptor: ResponseInterceptor): this {
+        const idx = this.pendingResponseInterceptors.indexOf(interceptor);
+        if (idx !== -1) {
+            this.pendingResponseInterceptors.splice(idx, 1);
+            return this;
+        }
+        if (this.agent) {
+            this.requireAgentMethod("removeResponseInterceptor");
+            this.agent.removeResponseInterceptor!(interceptor);
+        }
+        return this;
+    }
+
+    /** Elimina todos los interceptores de response (cola + agente activo). */
+    clearResponseInterceptors(): this {
+        this.pendingResponseInterceptors = [];
+        if (this.agent) {
+            this.requireAgentMethod("clearResponseInterceptors");
+            this.agent.clearResponseInterceptors!();
+        }
+        return this;
+    }
+
+    /** Vuelca la cola de interceptores pendientes sobre el agente activo. */
+    private flushPendingInterceptors(): void {
+        if (!this.agent) return;
+        while (this.pendingRequestInterceptors.length) {
+            const i = this.pendingRequestInterceptors.shift()!;
+            this.requireAgentMethod("addRequestInterceptor");
+            this.agent.addRequestInterceptor!(i);
+        }
+        while (this.pendingResponseInterceptors.length) {
+            const i = this.pendingResponseInterceptors.shift()!;
+            this.requireAgentMethod("addResponseInterceptor");
+            this.agent.addResponseInterceptor!(i);
+        }
+    }
+
+    /** Falla con un error descriptivo si el agente no soporta interceptores. */
+    private requireAgentMethod(method: keyof HttpAgent & string): void {
+        const agent = this.agent as Record<string, unknown> | null;
+        if (!agent || typeof agent[method] !== "function") {
+            throw new Error(
+                `El agente HTTP configurado no soporta interceptores (falta "${method}"). ` +
+                "Provee una instancia de HttpService o deja que AzureDevOpsApi cree su agente interno."
+            );
+        }
     }
 
     private getAgent(): HttpAgent {
@@ -277,6 +407,7 @@ export class AzureDevOpsApi {
             this.agent = new HttpService();
             this.ownAgent = true;
         }
+        this.flushPendingInterceptors();
         return this.agent;
     }
 
@@ -316,17 +447,24 @@ export class AzureDevOpsApi {
         const prefix = opts?.organizationLevel ? "" : this.projectPath(opts);
         const url = `${this.baseUrl}${prefix}/_apis${apiPath}`;
         const agent = this.getAgent();
-        return agent.request<T>({
-            url,
-            method,
-            headers: this.authHeaders(),
-            body: opts?.body,
-            query: {
-                "api-version": this.version(opts),
-                ...opts?.query
-            },
-            exec: opts?.exec
-        });
+        try {
+            return await agent.request<T>({
+                url,
+                method,
+                headers: this.authHeaders(),
+                body: opts?.body,
+                query: {
+                    "api-version": this.version(opts),
+                    ...opts?.query
+                },
+                exec: opts?.exec
+            });
+        } catch (err) {
+            // Enriquece los errores HTTP con el detalle legible de Azure DevOps
+            // (message/typeKey/TF-code del body + sugerencias). El error envuelto
+            // conserva `status`, así que los checks de 404 siguen funcionando.
+            throw toAzdoApiError(err);
+        }
     }
 
     // =========================================================================

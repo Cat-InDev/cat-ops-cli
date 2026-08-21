@@ -67,6 +67,9 @@ export type {
     AzdoGitItem
 } from "./services/azdo-api";
 
+export { AzdoApiError, parseAzdoError, formatAzdoError } from "./services/azdo-errors";
+export type { AzdoErrorDetail, AzdoErrorBody } from "./services/azdo-errors";
+
 export { Notifier } from "./core/Notifier";
 export * as senders from "./core/senders";
 export * as classifiers from "./core/classifiers";

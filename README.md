@@ -6,7 +6,8 @@ Trae:
 
 - Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
 - **16 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`, `yaml`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`) + un **motor de pipelines** declarativo con dependencias (`Pipeline`).
-- **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout.
+- **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout. Los interceptores también se pueden registrar sobre el agente que integra `AzureDevOpsApi`.
+- **Parser de errores de Azure DevOps**: cada fallo de la REST API se convierte en un `AzdoApiError` legible con el mensaje del servidor, código TF/VS, tipo de excepción y sugerencias accionables (`parseAzdoError` / `formatAzdoError`).
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
 - **retry / timeout / dryRun** en cada comando de shell.
 - Validación cíclica de rollouts de Kubernetes/OpenShift (`waitForDeployment`, `waitForDeploymentGroup`).
@@ -89,7 +90,7 @@ src/
     http.ts           -> cliente HTTP con interceptores de request/response, múltiples instancias
     http-types.ts     -> tipos del servicio HTTP (HttpRequest, HttpResponse, interceptors, ...)
     docker.ts, git.ts, kubectl.ts, helm.ts, npm.ts, archive.ts
-    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts, az.ts, azdo.ts, azdo-api.ts, pipeline.ts
+    terraform.ts, ansible.ts, argocd.ts, tekton.ts, oc.ts, az.ts, azdo.ts, azdo-api.ts, azdo-errors.ts, pipeline.ts
     yaml.ts              -> YamlService: manipulación de archivos YAML con prepare(), multidocument, comentarios
     index.ts           -> registra todos los servicios anteriores (ServicesRegistry)
   index.ts             -> entry point público: Context, Menu, Notifier, senders, classifiers, messages, services, http, tipos
@@ -428,6 +429,45 @@ const azdo = new AzureDevOpsApi().configure({
 });
 ```
 
+### Interceptores del agente HTTP
+
+`AzureDevOpsApi` integra su propio agente HTTP (se crea perezosamente en la primera petición) y permite registrar **interceptores de request/response** sobre él, igual que en `ctx.services.http`:
+
+```typescript
+const azdo = new AzureDevOpsApi().configure({
+    baseUrl: "https://dev.azure.com/miorg",
+    pat: process.env.AZDO_PAT,
+    project: "mi-proyecto",
+
+    // Se registran sobre el agente activo (interno o inyectado)
+    requestInterceptors: [
+        ctx => { ctx.request.headers["x-correlation-id"] = crypto.randomUUID(); }
+    ],
+    responseInterceptors: [
+        ctx => { console.log(`← ${ctx.response.status} ${ctx.request.url}`); }
+    ]
+});
+```
+
+También hay métodos chainable para gestionarlos en cualquier momento — si el agente interno aún no existe, quedan en cola y se aplican al crearlo:
+
+```typescript
+azdo
+    .addRequestInterceptor(ctx => { /* tracing, headers extra, ... */ })
+    .addResponseInterceptor(ctx => { /* logging, métricas, ... */ });
+
+// Eliminar uno específico o todos
+azdo.removeRequestInterceptor(myInterceptor);
+azdo.clearRequestInterceptors();
+azdo.clearResponseInterceptors();
+```
+
+Detalles a tener en cuenta:
+
+- Si inyectas un `agent` externo (`HttpService`), los interceptores se registran **en ese agente**, así que también afectan al resto de consumidores que compartan la instancia.
+- El auth Basic del PAT se aplica siempre, independientemente de los interceptores.
+- Un agente custom que no exponga los métodos de interceptores lanza un error descriptivo en vez de ignorarlos silenciosamente.
+
 ### Proyectos
 
 ```typescript
@@ -525,6 +565,47 @@ await azdo.listRepos({ exec: { dryRun: true } });
 ```
 
 Los tipos de respuesta completos (`AzdoProject`, `AzdoGitRepository`, `AzdoBuild`, etc.) se exportan desde la raíz del paquete para tipado en TypeScript.
+
+### Errores legibles (`AzdoApiError`)
+
+La REST API de Azure DevOps devuelve errores con cuerpo JSON rico (`message`, `typeKey`, `errorCode`, `innerException`, ...), pero el detalle se perdía en un genérico `HTTP 403 responded with 403`. Cualquier error HTTP de `AzureDevOpsApi` se lanza ahora como **`AzdoApiError`**, que parsea ese cuerpo y lo presenta de forma legible:
+
+```typescript
+try {
+    await azdo.pushChanges({ project: "mi-proyecto", repository: "api", branch: "main", comment: "x", changes: [] });
+} catch (err) {
+    console.log(String(err));
+}
+```
+
+```
+✖ Azure DevOps permisos — HTTP 403 Forbidden
+  Petición : POST https://dev.azure.com/miorg/mi-proyecto/_apis/git/repositories/api/pushes?api-version=7.1
+  Mensaje  : TF401027: You need the Git 'ForcePush' permission to perform this operation.
+  Detalle  : código=TF401027 · tipo=RequestNotAuthorizedException · errorCode=0 · eventId=3000
+  Qué significa: Falta el permiso 'ForcePush' de Git.
+  Sugerencias:
+    • Un admin debe conceder 'Force push (rewrite history)' en Repos > Security, o evita reescribir historial.
+    • Pide al administrador los permisos necesarios sobre el proyecto/repo/pipeline.
+    • Si el PAT tiene restricciones de scope, amplíalo (ej. Code Read & Write, Build).
+```
+
+Qué aporta cada pieza:
+
+| API | Uso |
+|---|---|
+| `err.message` | Resumen de una línea: `[AZDO] HTTP 403 Forbidden — POST ... — TF401027: You need...` |
+| `String(err)` / `formatAzdoError(err)` | Bloque multi-línea legible (el del ejemplo) |
+| `err.detail` | Detalle estructurado: `{ status, kind, serverMessage, code, typeKey, errorCode, eventId, innerMessages, hints, ... }` |
+| `parseAzdoError(err)` | Parsea cualquier error con forma HTTP y devuelve el detalle (o `null`) |
+| `formatAzdoError(err)` | Devuelve el texto legible; acepta el error o el detalle ya parseado |
+
+Notas:
+
+- El error conserva `status`, `headers`, `body` y `request` del error HTTP original, así que los checks tipo `err.status === 404` siguen funcionando igual que siempre (y helpers como `branchExists()`/`repoExists()` no cambian).
+- Detecta códigos TF/VS conocidos (`TF400813`, `TF401019`, `TF401027`, `TF401320`, `VS800075`, ...) con explicación y sugerencia específica; los desconocidos caen a sugerencias por status HTTP (401 → PAT expirado/org incorrecta, 404 → puede ser falta de permisos, 409 → `oldObjectId` desactualizado, 429 → throttling, etc.).
+- Aplana la cadena `innerException` del servidor en `detail.innerMessages`.
+- Soporta cuerpos no-JSON (proxies que devuelven HTML) y clasifica errores de red/timeout (`status: 0`) como `Red / Timeout`.
 
 ## Motor de pipelines declarativo (`ctx.services.pipeline`)
 
@@ -1403,6 +1484,8 @@ npm test
 - `exec-options-passthrough.test.js` — retry/timeout/dryRun (`exec`) llegando a todos los servicios, incluyendo un retry real que se recupera tras 2 fallos
 - `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)
 - `azdo-api.test.js` — AzureDevOpsApi contra mock server: proyectos, repos, branches, commits, PRs, builds, pipelines, work items, overrides
+- `azdo-errors.test.js` — parser de errores de Azure DevOps: extracción de message/typeKey/código TF/VS, innerException aplanada, cuerpos no-JSON, errores de red, formato legible, compatibilidad de los checks de 404 tras el wrap
+- `azdo-interceptors.test.js` — interceptores del agente HTTP de AzureDevOpsApi: vía configure() y vía métodos add/remove/clear, cola perezosa antes del primer request, agente externo compartido, error descriptivo con agentes sin soporte
 - `pipeline.test.js` — Pipeline motor: stages/jobs/tasks, dependencias cross-level con paths dotted, resultados jerárquicos (stage.job.task), fluent API, registry, reset, ctx access, detección de tipo por propiedad, PipelineResultsAccessor
 - `service-notify.test.js` — ServiceError, ctx.wrap(), Notifier con service/method/args, classifiers.byService/messages.byService, unwrap de ServiceError en byCommand/byPattern/byRule, integración completa, backward compat
 - `yaml.test.js` — YamlService: fromYaml/fromJson, yamlGet/yamlSet/yamlPush/yamlOmit, comment(), prepare() con $set/$push/$spread/$superSet/$merge/$delete, multidocument/use/clone
