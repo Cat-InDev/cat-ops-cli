@@ -52,10 +52,9 @@ test("ctx.run() dispara hooks.onError y notifier.reportError, y re-lanza el erro
 
 });
 
-test("un item de menú con onError captura el error sin interrumpir el menú", async () => {
+test("un item de menú que falla lanza por defecto y mata el proceso (vía main)", async () => {
 
     const ctx = Context.reset();
-    ctx.setFlag("__auto_exit_test", true);
 
     let onErrorCalled = false;
     const notifierEvents = [];
@@ -76,12 +75,52 @@ test("un item de menú con onError captura el error sin interrumpir el menú", a
 
     ctx.params["menu-selector"] = "fail";
 
-    // No debe lanzar: Menu.executeEntry atrapa el error internamente.
+    // Por defecto el error se re-lanza después de notificar.
+    await assert.rejects(
+        () => Menu.render(menu, ctx),
+        /item falló/
+    );
+
+    assert.equal(onErrorCalled, true);
+    assert.equal(notifierEvents.length, 1);
+    assert.equal(notifierEvents[0].taskId, "Fail");
+
+});
+
+test("con --catch=no-throw el error se traga sin interrumpir el menú", async () => {
+
+    const ctx = Context.reset();
+
+    let onErrorCalled = false;
+    const notifierEvents = [];
+
+    ctx.notifier.channel("unclassified", event => notifierEvents.push(event));
+
+    const menu = {
+        title: "Test",
+        "flag-selector": "--menu-selector",
+        options: {
+            Fail: {
+                selector: "fail",
+                action: () => { throw new Error("item falló"); },
+                onError: () => { onErrorCalled = true; }
+            }
+        }
+    };
+
+    ctx.params["menu-selector"] = "fail";
+    ctx.params.catch = "no-throw";
+
+    // No debe lanzar: el usuario pidió explícitamente no-throw.
     await Menu.render(menu, ctx);
 
     assert.equal(onErrorCalled, true);
     assert.equal(notifierEvents.length, 1);
     assert.equal(notifierEvents[0].taskId, "Fail");
+
+    // El fallo queda registrado en el ctx por si se quiere auditar.
+    assert.equal(ctx.hasFailures(), true);
+    assert.deepEqual(ctx.failures.map(f => f.label), ["Fail"]);
 
 });
 

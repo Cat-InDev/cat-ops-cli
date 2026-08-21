@@ -1417,5 +1417,5 @@ npm test
 - Publicar en un registro privado (Verdaccio/Artifactory/GitHub Packages) para instalarlo con scope, p.ej. `@miorg/catops-cli`.
 - Agregar más plugins (`ansible-lint`, `trivy`, `sonar-scanner`) con el mismo patrón que `terraform.ts`/`docker.ts`.
 - CI propio (GitHub Actions/Azure Pipelines) que corra `npm test` en cada PR antes de `npm publish`.
-- `--catch=throw` (o similar) para que un item de menú fallido mate el proceso completo en vez de solo loguear y seguir — útil corriendo vía `--menu-selector` dentro de un step de Azure Pipelines.
+- ~~`--catch=throw` (o similar) para que un item de menú fallido mate el proceso completo~~ **Hecho e invertido**: ahora un item de menú fallido lanza el error y mata el proceso con exit 1 por defecto (útil corriendo vía `--menu-selector` dentro de un step de Azure Pipelines). Con `--catch=no-throw` se traga el error y el menú sigue operando.
 - Exportar tipos YAML (`YamlPrepareActions`) y crear helpers para templates comunes (Kubernetes manifests, Helm values, etc.).

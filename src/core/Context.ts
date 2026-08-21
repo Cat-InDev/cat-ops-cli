@@ -17,6 +17,7 @@ export class Context {
     env: NodeJS.ProcessEnv = { ...process.env };
     vars: Record<string, unknown> = {};
     results: Record<string, unknown> = {};
+    failures: Array<{ label: string; error: unknown }> = [];
     logger: Logger = logger;
     services: ServicesRegistry = services;
     notifier: Notifier = new Notifier();
@@ -63,6 +64,21 @@ export class Context {
     }
 
     // ---- results del pipe ----
+
+    /**
+     * Registra una task fallida (label + error). El CLI usa esto al final
+     * para decidir el exit code: si hubo fallos, sale con código 1 aunque
+     * el menú haya seguido funcionando.
+     */
+    markFailure(label: string, error: unknown): this {
+        this.failures.push({ label, error });
+        return this;
+    }
+
+    hasFailures(): boolean {
+        return this.failures.length > 0;
+    }
+
 
     /**
      * Ejecuta una task, guarda su resultado en `ctx.results[taskId]`, y

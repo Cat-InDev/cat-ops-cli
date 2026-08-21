@@ -106,7 +106,14 @@ export class Menu {
                 await ctx.notifier.reportError(label, error, ctx);
 
                 logger.error(errorMessage(error));
-                if(ctx.params.catch === "throw" || ctx.flags.catch === "throw") throw error;
+
+                // Por defecto el error se re-lanza y mata el proceso (exit 1).
+                // Solo con --catch=no-throw se traga para seguir operando.
+                const noThrow = ctx.params.catch === "no-throw" || ctx.flags.catch === "no-throw";
+
+                if (!noThrow) throw error;
+
+                ctx.markFailure(label, error);
             }
 
             return;
