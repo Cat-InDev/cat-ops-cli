@@ -1,5 +1,6 @@
 import type { HttpRequest, HttpResponse } from "./http-types";
 import type { ExecOptions } from "../core/types";
+import { HttpService } from "./http";
 
 // Re-export the HttpService type for configure()
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
@@ -271,11 +272,20 @@ export class AzureDevOpsApi {
 
     private getAgent(): HttpAgent {
         if (!this.agent) {
+            // Agente interno: se crea perezosamente en la primera petición,
+            // tal como promete la documentación de AzureDevOpsApiConfig.agent.
+            this.agent = new HttpService();
+            this.ownAgent = true;
+        }
+        return this.agent;
+    }
+
+    private assertConfigured(): void {
+        if (!this.baseUrl || !this.pat) {
             throw new Error(
                 "AzureDevOpsApi not configured. Call .configure({ baseUrl, pat }) first."
             );
         }
-        return this.agent;
     }
 
     private authHeaders(): Record<string, string> {
@@ -302,6 +312,7 @@ export class AzureDevOpsApi {
         apiPath: string,
         opts?: AzdoRequestOptions & { body?: unknown }
     ): Promise<HttpResponse<T>> {
+        this.assertConfigured();
         const prefix = opts?.organizationLevel ? "" : this.projectPath(opts);
         const url = `${this.baseUrl}${prefix}/_apis${apiPath}`;
         const agent = this.getAgent();

@@ -262,10 +262,13 @@ class HttpRegistry {
     // ---- agent management ----
 
     /**
-     * Registra un agente nombrado con su propia configuración, interceptores
-     * y defaults. Si ya existe un agente con ese nombre, lo reemplaza.
+     * Crea un agente nombrado a partir de parámetros de configuración.
+     * El `HttpService` interno se construye aquí — no hace falta instanciarlo
+     * por fuera. Si ya existe un agente con ese nombre, lo reemplaza.
      */
-    createAgent(agent: HttpService, name: string): this {
+    createAgent(name: string, config?: HttpServiceConfig): this {
+        const agent = new HttpService();
+        if (config) agent.configure(config);
         this.agents.set(name, agent);
         return this;
     }

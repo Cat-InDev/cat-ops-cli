@@ -88,6 +88,42 @@ test("configure() es chainable", () => {
 
 });
 
+test("configure() sin agent crea un agente interno y las peticiones funcionan", async () => {
+
+    let receivedAuth = null;
+    let receivedPath = null;
+
+    const server = http.createServer((req, res) => {
+        receivedAuth = req.headers["authorization"];
+        receivedPath = req.url;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ count: 1, value: [{ id: "repo-1", name: "my-repo" }] }));
+    });
+
+    await new Promise((resolve) => server.listen(0, resolve));
+    const url = `http://localhost:${server.address().port}`;
+
+    try {
+        const api = new AzureDevOpsApi().configure({
+            baseUrl: url,
+            pat: "internal-agent-pat",
+            project: "my-project"
+        });
+
+        const res = await api.listRepos();
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.count, 1);
+        assert.match(receivedPath, /\/my-project\/_apis\/git\/repositories/);
+
+        const expected = Buffer.from(":internal-agent-pat").toString("base64");
+        assert.equal(receivedAuth, `Basic ${expected}`);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
 // ---------------------------------------------------------------------------
 // Auth headers
 // ---------------------------------------------------------------------------

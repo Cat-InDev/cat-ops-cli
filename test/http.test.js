@@ -577,20 +577,24 @@ test("configure(), addRequestInterceptor(), addResponseInterceptor() son chainab
 
 test("createAgent() registra un agente y agent() lo devuelve", async () => {
 
+    let receivedSource = null;
+
     const { server, url } = await createServer((req, res) => {
+        receivedSource = req.headers["x-source"];
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ from: "internal" }));
     });
 
-    const internal = new HttpService()
-        .configure({ baseUrl: url, defaultHeaders: { "x-source": "internal" } });
-
-    httpService.createAgent(internal, "internal");
+    httpService.createAgent("internal", {
+        baseUrl: url,
+        defaultHeaders: { "x-source": "internal" }
+    });
 
     const res = await httpService.agent("internal").get("/test");
 
     assert.equal(res.status, 200);
     assert.deepEqual(res.body, { from: "internal" });
+    assert.equal(receivedSource, "internal");
 
     httpService.removeAgent("internal");
     await closeServer(server);
@@ -608,8 +612,7 @@ test("agent() lanza si el agente no existe", () => {
 
 test("removeAgent() elimina el agente y agent() ya no lo encuentra", () => {
 
-    const svc = new HttpService();
-    httpService.createAgent(svc, "temp");
+    httpService.createAgent("temp");
 
     assert.deepEqual(httpService.listAgents().includes("temp"), true);
 
@@ -624,8 +627,8 @@ test("removeAgent() elimina el agente y agent() ya no lo encuentra", () => {
 
 test("listAgents() devuelve los nombres de todos los agentes registrados", () => {
 
-    httpService.createAgent(new HttpService(), "alpha");
-    httpService.createAgent(new HttpService(), "beta");
+    httpService.createAgent("alpha");
+    httpService.createAgent("beta");
 
     const names = httpService.listAgents();
 
@@ -642,13 +645,12 @@ test("agentes nombrados tienen interceptores aislados entre sí", async () => {
     const orderA = [];
     const orderB = [];
 
-    const agentA = new HttpService()
-        .addRequestInterceptor(() => { orderA.push("a"); });
-    const agentB = new HttpService()
-        .addRequestInterceptor(() => { orderB.push("b"); });
-
-    httpService.createAgent(agentA, "agentA");
-    httpService.createAgent(agentB, "agentB");
+    httpService.createAgent("agentA", {
+        requestInterceptors: [() => { orderA.push("a"); }]
+    });
+    httpService.createAgent("agentB", {
+        requestInterceptors: [() => { orderB.push("b"); }]
+    });
 
     const { server, url } = await createServer((req, res) => {
         res.writeHead(200, { "content-type": "application/json" });
@@ -677,12 +679,11 @@ test("agentes nombrados no afectan al default ni entre sí", async () => {
         defaultHeaders.push(ctx.request.headers["x-default"]);
     });
 
-    const agent = new HttpService()
-        .addRequestInterceptor((ctx) => {
+    httpService.createAgent("special", {
+        requestInterceptors: [(ctx) => {
             agentHeaders.push(ctx.request.headers["x-agent"]);
-        });
-
-    httpService.createAgent(agent, "special");
+        }]
+    });
 
     const { server, url } = await createServer((req, res) => {
         res.writeHead(200, { "content-type": "application/json" });
@@ -708,11 +709,8 @@ test("createAgent() reemplaza un agente existente con el mismo nombre", async ()
         res.end(JSON.stringify({ version: "v2" }));
     });
 
-    const v1 = new HttpService();
-    const v2 = new HttpService().configure({ baseUrl: url });
-
-    httpService.createAgent(v1, "versioned");
-    httpService.createAgent(v2, "versioned");
+    httpService.createAgent("versioned");
+    httpService.createAgent("versioned", { baseUrl: url });
 
     const res = await httpService.agent("versioned").get("/test");
 
@@ -723,11 +721,38 @@ test("createAgent() reemplaza un agente existente con el mismo nombre", async ()
 
 });
 
+test("createAgent() aplica responseInterceptors del config", async () => {
+
+    const { server, url } = await createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { inner: "value" } }));
+    });
+
+    httpService.createAgent("unwrap", {
+        baseUrl: url,
+        responseInterceptors: [
+            (ctx) => {
+                if (ctx.response.body?.data) {
+                    ctx.response.body = ctx.response.body.data;
+                }
+            }
+        ]
+    });
+
+    const res = await httpService.agent("unwrap").get("/test");
+
+    assert.deepEqual(res.body, { inner: "value" });
+
+    httpService.removeAgent("unwrap");
+    await closeServer(server);
+
+});
+
 test("createAgent() es chainable", () => {
 
     const result = httpService
-        .createAgent(new HttpService(), "a")
-        .createAgent(new HttpService(), "b");
+        .createAgent("a")
+        .createAgent("b");
 
     assert.equal(result, httpService);
 

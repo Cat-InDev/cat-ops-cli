@@ -924,24 +924,16 @@ await ctx.services.http.post("/users", data);
 **Agentes nombrados** — para APIs distintas con configuración propia:
 
 ```javascript
-import { HttpService } from "catops-cli";
+// Crear agentes a partir de parámetros — el HttpService interno se crea solo
+ctx.services.http.createAgent("github", {
+    baseUrl: "https://api.github.com",
+    defaultHeaders: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
+});
 
-// Crear y registrar un agente
-ctx.services.http.createAgent(
-    new HttpService().configure({
-        baseUrl: "https://api.github.com",
-        defaultHeaders: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
-    }),
-    "github"
-);
-
-ctx.services.http.createAgent(
-    new HttpService().configure({
-        baseUrl: "https://internal.mycompany.com/api",
-        defaultHeaders: { "X-API-Key": process.env.INTERNAL_KEY }
-    }),
-    "internal"
-);
+ctx.services.http.createAgent("internal", {
+    baseUrl: "https://internal.mycompany.com/api",
+    defaultHeaders: { "X-API-Key": process.env.INTERNAL_KEY }
+});
 
 // Usar por nombre — cada uno tiene interceptores y config aislados
 await ctx.services.http.agent("github").get("/repos/org/repo");
@@ -958,35 +950,38 @@ ctx.services.http.listAgents();  // ["github", "internal"]
 ctx.services.http.removeAgent("github");
 
 // Reemplazar un agente existente (mismo nombre)
-ctx.services.http.createAgent(new HttpService().configure({...}), "internal");
+ctx.services.http.createAgent("internal", { baseUrl: "https://nueva-api.mycompany.com" });
 ```
 
 **Ejemplo completo — interceptores por agente:**
 
 ```javascript
-const github = new HttpService()
-    .configure({
-        baseUrl: "https://api.github.com",
-        defaultHeaders: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
-    })
-    .addRequestInterceptor((ctx) => {
-        ctx.request.headers["Accept"] = "application/vnd.github.v3+json";
-    })
-    .addResponseInterceptor((ctx) => {
-        if (ctx.response.body?.data) {
-            ctx.response.body = ctx.response.body.data;
+ctx.services.http.createAgent("github", {
+    baseUrl: "https://api.github.com",
+    defaultHeaders: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` },
+    requestInterceptors: [
+        (ctx) => {
+            ctx.request.headers["Accept"] = "application/vnd.github.v3+json";
         }
-    });
+    ],
+    responseInterceptors: [
+        (ctx) => {
+            if (ctx.response.body?.data) {
+                ctx.response.body = ctx.response.body.data;
+            }
+        }
+    ]
+});
 
-const internal = new HttpService()
-    .configure({ baseUrl: "https://internal.mycompany.com/api" })
-    .addRequestInterceptor(async (ctx) => {
-        const token = await fetchTokenFromVault();
-        ctx.request.headers["Authorization"] = `Bearer ${token}`;
-    });
-
-ctx.services.http.createAgent(github, "github");
-ctx.services.http.createAgent(internal, "internal");
+ctx.services.http.createAgent("internal", {
+    baseUrl: "https://internal.mycompany.com/api",
+    requestInterceptors: [
+        async (ctx) => {
+            const token = await fetchTokenFromVault();
+            ctx.request.headers["Authorization"] = `Bearer ${token}`;
+        }
+    ]
+});
 
 // Cada agente usa sus propios interceptores
 await ctx.services.http.agent("github").get("/repos/org/repo");
