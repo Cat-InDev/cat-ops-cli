@@ -6,7 +6,7 @@ Trae:
 
 - Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
 - **16 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`, `yaml`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`) + un **motor de pipelines** declarativo con dependencias (`Pipeline`).
-- **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout. Los interceptores también se pueden registrar sobre el agente que integra `AzureDevOpsApi`.
+- **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout. Los interceptores también se pueden registrar sobre el agente que integra `AzureDevOpsApi`. Modo TLS inseguro (`insecureTls`) para servidores con certificado autofirmado o CA interna no confiable.
 - **Parser de errores de Azure DevOps**: cada fallo de la REST API se convierte en un `AzdoApiError` legible con el mensaje del servidor, código TF/VS, tipo de excepción y sugerencias accionables (`parseAzdoError` / `formatAzdoError`).
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
 - **retry / timeout / dryRun** en cada comando de shell.
@@ -416,6 +416,7 @@ const azdo = new AzureDevOpsApi().configure({
     pat: process.env.AZDO_PAT,
     project: "mi-proyecto",         // project por defecto (opcional)
     apiVersion: "7.1",              // default
+    // insecureTls: true            // https con certificado autofirmado o CA interna
 });
 ```
 
@@ -467,6 +468,33 @@ Detalles a tener en cuenta:
 - Si inyectas un `agent` externo (`HttpService`), los interceptores se registran **en ese agente**, así que también afectan al resto de consumidores que compartan la instancia.
 - El auth Basic del PAT se aplica siempre, independientemente de los interceptores.
 - Un agente custom que no exponga los métodos de interceptores lanza un error descriptivo en vez de ignorarlos silenciosamente.
+
+### Conexiones TLS inseguras (`insecureTls`)
+
+Si tu Azure DevOps Server usa HTTPS con un certificado autofirmado o una CA corporativa que tu máquina no confía, activa `insecureTls` para que el cliente acepte el certificado sin validarlo. No requiere instalar ni configurar ningún certificado:
+
+```typescript
+const azdo = new AzureDevOpsApi().configure({
+    baseUrl: "https://azdos.internal:8080/miorg",
+    pat: process.env.AZDO_PAT,
+    insecureTls: true   // acepta cualquier certificado TLS del servidor
+});
+```
+
+La opción se propaga al agente que sea:
+
+- **Agente interno**: se crea ya configurado en la primera petición (el agente es perezoso).
+- **Agente externo** (`agent: ctx.services.http.agent(...)`): se configura al llamar `configure()`, así que el resto de consumidores de esa misma instancia `HttpService` también quedan en modo inseguro.
+- **Por llamada**: tiene prioridad sobre la configuración global, igual que los demás overrides:
+
+```typescript
+await azdo.listRepos({ insecureTls: true });           // solo esta llamada es insegura
+const err = await azdo.listProjects().catch(e => e);   // sin override -> falla el handshake
+```
+
+`azdo.isInsecureTls()` consulta el estado actual.
+
+**Importante**: desactivar la validación TLS te expone a ataques man-in-the-middle. Úsalo solo contra servidores de confianza dentro de tu red (Azure DevOps Server on-premise, proxies corporativos, etc.).
 
 ### Proyectos
 
@@ -551,7 +579,7 @@ const query = await azdo.queryWorkItems(
 
 ### Overrides por llamada
 
-Cada método acepta un objeto de opciones con `project`, `apiVersion`, `query`, y `exec`:
+Cada método acepta un objeto de opciones con `project`, `apiVersion`, `query`, `insecureTls` y `exec`:
 
 ```typescript
 // project override → usa otro proyecto solo para esta llamada
@@ -559,6 +587,9 @@ await azdo.listRepos({ project: "otro-proyecto" });
 
 // organization-level → omite el project de la URL
 await azdo.listProjects({ organizationLevel: true });
+
+// TLS inseguro solo para esta llamada (certificado autofirmado / CA interna)
+await azdo.listBuilds({ definitionId: 5, insecureTls: true });
 
 // dry-run — solo loguea la petición HTTP sin enviarla
 await azdo.listRepos({ exec: { dryRun: true } });
@@ -899,7 +930,8 @@ ctx.services.http.configure({
         "Authorization": `Bearer ${process.env.API_TOKEN}`,
         "Accept": "application/json"
     },
-    defaultTimeout: 10000  // 10 segundos
+    defaultTimeout: 10000,  // 10 segundos
+    insecureTls: false      // true = acepta cualquier certificado TLS del servidor
 });
 
 // Ahora las peticiones son relativas
@@ -1082,6 +1114,31 @@ await ctx.services.http.post("/data", payload, {
     exec: { dryRun: true }       // soporte dry-run
 });
 ```
+
+### TLS inseguro (`insecureTls`)
+
+Para servidores con certificado autofirmado o firmado por una CA interna que tu máquina no confía (Azure DevOps Server on-premise, proxies corporativos, ...), activa `insecureTls` y el agente omitirá la validación del certificado TLS. No requiere gestionar ningún certificado:
+
+```javascript
+// Global para el agente (y para cada agente nombrado que lo declare en su config)
+ctx.services.http.configure({ baseUrl: "https://azdos.internal:8080", insecureTls: true });
+
+// O solo para una llamada puntual — prioridad sobre el default del agente
+await ctx.services.http.get("https://azdos.internal:8080/ping", { insecureTls: true });
+
+// Agentes nombrados también aceptan la opción en createAgent()
+ctx.services.http.createAgent("onprem", {
+    baseUrl: "https://azdos.internal:8080",
+    insecureTls: true
+});
+
+// Consultar el estado de un agente
+ctx.services.http.agent("onprem").isInsecureTls(); // true
+```
+
+Sin `insecureTls`, un certificado no confiable falla con un error descriptivo (`status: 0`, causa real en el mensaje — no un genérico "fetch failed").
+
+**Importante**: desactivar la validación TLS te expone a ataques man-in-the-middle. Úsalo solo contra servidores de confianza dentro de tu red.
 
 ### Interceptors con async/await
 
@@ -1480,6 +1537,7 @@ npm test
 - `notifier.test.js` — classify/channel/onSuccess/describeError/byRule
 - `senders.test.js` — file/http/webhook/log contra servidores reales en localhost
 - `http.test.js` — servicio HTTP: métodos, headers, query, interceptors, abort, timeout, dryRun, múltiples instancias aisladas
+- `http-insecure.test.js` — TLS inseguro contra un servidor HTTPS real con certificado autofirmado: rechazo por defecto, aceptación con insecureTls global/nombrado/por-petición y herencia de AzureDevOpsApi al agente interno perezoso y al externo inyectado
 - `kubectl.test.js`, `oc.test.js` — kubeconfig/namespace, waitForDeployment (éxito, timeout, Failed, maxRestarts)
 - `exec-options-passthrough.test.js` — retry/timeout/dryRun (`exec`) llegando a todos los servicios, incluyendo un retry real que se recupera tras 2 fallos
 - `deployment-group.test.js` — waitForDeploymentGroup (éxito total, fallo parcial, label sin matches, oc con `dc`)

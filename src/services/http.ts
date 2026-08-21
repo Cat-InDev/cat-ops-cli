@@ -1,4 +1,6 @@
 import { logger } from "../core/logger";
+import nodeHttp from "node:http";
+import nodeHttps from "node:https";
 import type {
     HttpMethod,
     HttpRequest,
@@ -83,6 +85,9 @@ class HttpService {
     private baseUrl = "";
     private defaultHeaders: Record<string, string> = {};
     private defaultTimeout = 0;
+    private insecureTls = false;
+    /** Agente dedicado para TLS inseguro — se crea perezosamente. */
+    private insecureAgent: nodeHttps.Agent | null = null;
     private requestInterceptors: RequestInterceptor[] = [];
     private responseInterceptors: ResponseInterceptor[] = [];
 
@@ -90,9 +95,138 @@ class HttpService {
         if (config.baseUrl !== undefined) this.baseUrl = config.baseUrl;
         if (config.defaultHeaders !== undefined) this.defaultHeaders = { ...config.defaultHeaders };
         if (config.defaultTimeout !== undefined) this.defaultTimeout = config.defaultTimeout;
+        if (config.insecureTls !== undefined) this.insecureTls = config.insecureTls;
         if (config.requestInterceptors) this.requestInterceptors = [...config.requestInterceptors];
         if (config.responseInterceptors) this.responseInterceptors = [...config.responseInterceptors];
         return this;
+    }
+
+    /** Indica si este agente acepta certificados TLS no confiables. */
+    isInsecureTls(): boolean {
+        return this.insecureTls;
+    }
+
+    /**
+     * Transporte alternativo para TLS inseguro (certificados autofirmados,
+     * CAs corporativas no instaladas, ...): usa node:http/https con
+     * `rejectUnauthorized: false` y devuelve un `Response` estándar para que
+     * el resto del pipeline (parseo, interceptores, errores) sea idéntico al
+     * del fetch normal. Sigue redirecciones hasta MAX_REDIRECTS.
+     */
+    private insecureFetch(url: string, init: RequestInit): Promise<globalThis.Response> {
+
+        const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+        const abortError = (signal: AbortSignal): Error => {
+            // Misma semántica que el timeout de fetch: DOMException TimeoutError.
+            return signal.reason instanceof Error && signal.reason.name === "TimeoutError"
+                ? signal.reason
+                : new DOMException("The operation was aborted.", "TimeoutError");
+        };
+
+        // Agente propio (no el global): sin keep-alive para no retener sockets
+        // abiertos tras la respuesta — crítico en CLI y tests.
+        if (!this.insecureAgent) {
+            this.insecureAgent = new nodeHttps.Agent({
+                rejectUnauthorized: false,
+                keepAlive: false
+            });
+        }
+        const insecureAgent = this.insecureAgent;
+
+        return new Promise((resolve, reject) => {
+
+            const doRequest = (targetUrl: string, redirectsLeft: number): void => {
+
+                let parsed: URL;
+                try {
+                    parsed = new URL(targetUrl);
+                } catch {
+                    reject(new Error(`URL inválida: ${targetUrl}`));
+                    return;
+                }
+
+                const isHttps = parsed.protocol === "https:";
+                const transport = isHttps ? nodeHttps : nodeHttp;
+
+                const reqOptions: nodeHttps.RequestOptions = {
+                    hostname: parsed.hostname,
+                    port: parsed.port || (isHttps ? 443 : 80),
+                    path: parsed.pathname + parsed.search,
+                    method: init.method ?? "GET",
+                    headers: init.headers as Record<string, string> | undefined,
+                    // Núcleo de "TLS inseguro": no validar la cadena del servidor
+                    rejectUnauthorized: false,
+                    agent: isHttps ? insecureAgent : nodeHttp.globalAgent
+                };
+
+                const req = transport.request(reqOptions, (res) => {
+                    const status = res.statusCode ?? 0;
+
+                    if (REDIRECT_STATUSES.has(status)) {
+                        res.resume(); // drena el body pendiente
+                        const location = res.headers.location;
+                        if (!location || redirectsLeft <= 0) {
+                            reject(new Error(
+                                `HTTP ${status} sin Location utilizable o demasiados redireccionamientos en ${targetUrl}`
+                            ));
+                            return;
+                        }
+                        // 303 siempre pasa a GET; 301/302 degradan POST a GET
+                        // como hacen los navegadores; 307/308 conservan método.
+                        let nextMethod = init.method ?? "GET";
+                        if (status === 303 || ((status === 301 || status === 302) && nextMethod === "POST")) {
+                            nextMethod = "GET";
+                        }
+                        const nextInit: RequestInit = {
+                            method: nextMethod,
+                            headers: init.headers,
+                            signal: init.signal
+                        };
+                        if (nextMethod !== "GET" && typeof init.body === "string") nextInit.body = init.body;
+                        doRequest(new URL(location, targetUrl).toString(), redirectsLeft - 1);
+                        return;
+                    }
+
+                    const chunks: Buffer[] = [];
+                    res.on("data", chunk => chunks.push(chunk as Buffer));
+                    res.on("error", reject);
+                    res.on("end", () => {
+                        const headers = new Headers();
+                        for (const [key, value] of Object.entries(res.headers)) {
+                            if (Array.isArray(value)) headers.set(key, value.join(", "));
+                            else if (value !== undefined) headers.set(key, value);
+                        }
+                        resolve(new Response(Buffer.concat(chunks), {
+                            status,
+                            statusText: res.statusMessage ?? "",
+                            headers
+                        }));
+                    });
+                });
+
+                req.on("error", reject);
+
+                if (init.signal) {
+                    const signal = init.signal;
+                    if (signal.aborted) {
+                        req.destroy(abortError(signal));
+                        return;
+                    }
+                    signal.addEventListener(
+                        "abort",
+                        () => req.destroy(abortError(signal)),
+                        { once: true }
+                    );
+                }
+
+                if (typeof init.body === "string") req.write(init.body);
+                req.end();
+            };
+
+            doRequest(url, 5);
+
+        });
     }
 
     addRequestInterceptor(interceptor: RequestInterceptor): this {
@@ -187,12 +321,17 @@ class HttpService {
             fetchInit.signal = AbortSignal.timeout(timeout);
         }
 
+        // TLS inseguro: por-petición tiene prioridad sobre el default del agente
+        const insecure = req.insecureTls ?? this.insecureTls;
+
         logger.info(`HTTP ${method} ${ctx.request.url}`);
 
         let rawRes: globalThis.Response;
 
         try {
-            rawRes = await fetch(ctx.request.url, fetchInit);
+            rawRes = insecure
+                ? await this.insecureFetch(ctx.request.url, fetchInit)
+                : await fetch(ctx.request.url, fetchInit);
         } catch (error) {
             if (error instanceof DOMException && error.name === "TimeoutError") {
                 throw createHttpError(

@@ -4,10 +4,12 @@ import { HttpService } from "./http";
 import { toAzdoApiError } from "./azdo-errors";
 
 // Agente HTTP usable por AzureDevOpsApi. Además de `request`, puede exponer
-// los métodos de interceptores de HttpService — si no los expone (agente
-// custom minimalista), no se podrán registrar interceptores sobre él.
+// los métodos de interceptores y configuración de HttpService — si no los
+// expone (agente custom minimalista), esas funciones no estarán disponibles.
 interface HttpAgent {
     request<T = unknown>(req: HttpRequest): Promise<HttpResponse<T>>;
+    configure?(config: { insecureTls?: boolean }): unknown;
+    isInsecureTls?(): boolean;
     addRequestInterceptor?(interceptor: RequestInterceptor): unknown;
     removeRequestInterceptor?(interceptor: RequestInterceptor): unknown;
     clearRequestInterceptors?(): unknown;
@@ -32,6 +34,13 @@ export interface AzureDevOpsApiConfig {
     /** Agent HTTP a usar para las peticiones. Si no se pasa, se crea uno interno. */
     agent?: HttpAgent;
     /**
+     * Acepta certificados TLS no confiables (autofirmados, proxies de
+     * inspección corporativa). Se hereda al agente HTTP — interno o inyectado.
+     * Úsalo con cuidado: deshabilita la protección contra MITM; para CAs
+     * corporativas es preferible NODE_EXTRA_CA_CERTS.
+     */
+    insecureTls?: boolean;
+    /**
      * Interceptores de request que se registran en el agente HTTP
      * (interno o inyectado, siempre que lo soporte). Útiles para tracing,
      * headers extra, métricas, etc. Se ejecutan ANTES de enviar cada petición.
@@ -55,6 +64,8 @@ export interface AzdoRequestOptions {
     apiVersion?: string;
     /** Parámetros query extra. */
     query?: Record<string, string | number | boolean | undefined>;
+    /** Override por-llamada: desactiva la validación del certificado TLS. */
+    insecureTls?: boolean;
     /** Opciones de exec (dryRun, retry, timeout). */
     exec?: ExecOptions;
     /** Si es true, omite el project de la URL (para endpoints de organización). */
@@ -279,6 +290,8 @@ export class AzureDevOpsApi {
     /** Interceptores en cola mientras el agente (perezoso) aún no existe. */
     private pendingRequestInterceptors: RequestInterceptor[] = [];
     private pendingResponseInterceptors: ResponseInterceptor[] = [];
+    /** TLS inseguro heredado al agente HTTP (interno o inyectado). */
+    private insecureTls = false;
 
     configure(config: AzureDevOpsApiConfig): this {
         this.baseUrl = config.baseUrl.replace(/\/+$/, "");
@@ -289,11 +302,24 @@ export class AzureDevOpsApi {
             this.agent = config.agent;
             this.ownAgent = false;
         }
+        if (config.insecureTls !== undefined) {
+            this.insecureTls = config.insecureTls;
+            // Hereda la configuración al agente inyectado (si lo soporta);
+            // el interno se crea con ella al materializarse.
+            if (this.agent && typeof this.agent.configure === "function") {
+                this.agent.configure({ insecureTls: this.insecureTls });
+            }
+        }
         // Los interceptores se aplican al agente activo, o quedan en cola si
         // el agente interno todavía no se ha creado.
         for (const i of config.requestInterceptors ?? []) this.addRequestInterceptor(i);
         for (const i of config.responseInterceptors ?? []) this.addResponseInterceptor(i);
         return this;
+    }
+
+    /** Indica si las peticiones de este cliente aceptan certificados TLS no confiables. */
+    isInsecureTls(): boolean {
+        return this.insecureTls;
     }
 
     // ---- interceptores del agente HTTP ----
@@ -404,7 +430,9 @@ export class AzureDevOpsApi {
         if (!this.agent) {
             // Agente interno: se crea perezosamente en la primera petición,
             // tal como promete la documentación de AzureDevOpsApiConfig.agent.
-            this.agent = new HttpService();
+            const svc = new HttpService();
+            if (this.insecureTls) svc.configure({ insecureTls: true });
+            this.agent = svc;
             this.ownAgent = true;
         }
         this.flushPendingInterceptors();
@@ -457,6 +485,7 @@ export class AzureDevOpsApi {
                     "api-version": this.version(opts),
                     ...opts?.query
                 },
+                insecureTls: opts?.insecureTls,
                 exec: opts?.exec
             });
         } catch (err) {

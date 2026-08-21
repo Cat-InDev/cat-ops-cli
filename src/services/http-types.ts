@@ -9,6 +9,8 @@ export interface HttpRequest {
     body?: unknown;
     query?: Record<string, string | number | boolean | undefined>;
     timeout?: number;
+    /** Override por-petición: desactiva la validación del certificado TLS. */
+    insecureTls?: boolean;
     exec?: ExecOptions;
 }
 
@@ -67,7 +69,14 @@ export interface HttpServiceConfig {
     defaultHeaders?: Record<string, string>;
     /** Timeout por defecto en ms (0 = sin límite). */
     defaultTimeout?: number;
-    /** Interceptors de request que se ejecutan antes de cada petición. */
+    /**
+     * Desactiva la validación del certificado TLS en este agente
+     * (`rejectUnauthorized: false`). Útil detrás de proxies de inspección
+     * corporativa o contra servidores con certificados autofirmados.
+     * Úsalo con cuidado: deshabilita la protección contra MITM.
+     */
+    insecureTls?: boolean;
+    /** Interceptores de request que se ejecutan antes de cada petición. */
     requestInterceptors?: RequestInterceptor[];
     /** Interceptors de response que se ejecutan después de cada respuesta. */
     responseInterceptors?: ResponseInterceptor[];
