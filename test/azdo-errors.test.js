@@ -136,6 +136,48 @@ test("parseAzdoError clasifica errores de red/timeout (status 0)", () => {
 
 });
 
+test("parseAzdoError desentierra la causa real de la cadena cause del fetch", () => {
+
+    // Simula el TypeError("fetch failed") de undici con su cause encadenado
+    const root = new Error("getaddrinfo ENOTFOUND dev.azure.com");
+    root.code = "ENOTFOUND";
+    const fetchErr = new TypeError("fetch failed", { cause: root });
+    const httpErr = new Error("HTTP GET https://dev.azure.com/org/_apis/projects falló antes de recibir respuesta (ENOTFOUND · getaddrinfo ENOTFOUND dev.azure.com)");
+    httpErr.status = 0;
+    httpErr.body = null;
+    httpErr.cause = fetchErr;
+    httpErr.request = { url: "https://dev.azure.com/org/_apis/projects", method: "GET" };
+
+    const detail = parseAzdoError(httpErr);
+
+    assert.ok(detail);
+    assert.equal(detail.kind, "Red / Timeout");
+    assert.ok(detail.networkCause);
+    assert.match(detail.networkCause, /ENOTFOUND/);
+    assert.match(detail.networkCause, /getaddrinfo dev\.azure\.com|getaddrinfo ENOTFOUND/);
+    // Hint específico por código de red
+    assert.ok(detail.hints.some(h => /DNS|baseUrl/i.test(h)));
+
+});
+
+test("parseAzdoError da hint de CA corporativa en errores TLS", () => {
+
+    const root = new Error("unable to verify the first certificate");
+    root.code = "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
+    const err = new Error("fetch failed", { cause: root });
+    err.status = 0;
+    err.body = null;
+
+    const detail = parseAzdoError(err);
+
+    assert.ok(detail);
+    assert.match(detail.networkCause, /UNABLE_TO_VERIFY_LEAF_SIGNATURE/);
+    assert.ok(detail.hints.some(h => /NODE_EXTRA_CA_CERTS/.test(h)));
+
+});
+
+// ---------------------------------------------------------------------------
+// Integración con AzureDevOpsApi
 // ---------------------------------------------------------------------------
 // formatAzdoError
 // ---------------------------------------------------------------------------
@@ -249,5 +291,32 @@ test("los checks de status === 404 siguen funcionando tras el wrap", async () =>
     } finally {
         await new Promise(r => server.close(r));
     }
+
+});
+
+test("un fallo de red real (conexión rechazada) produce AzdoApiError descriptivo", async () => {
+
+    // Puerto cerrado → ECONNREFUSED determinista
+    const { server, url } = await startServer(() => null);
+    const port = server.address().port;
+    await new Promise(r => server.close(r));
+    const deadUrl = `http://localhost:${port}`;
+
+    const api = createApi(deadUrl);
+
+    const err = await api.listRepos().catch(e => e);
+
+    assert.ok(err instanceof AzdoApiError, `esperaba AzdoApiError, llegó: ${err?.constructor?.name}`);
+    assert.equal(err.status, 0);
+    // El mensaje ya no es un opaco "fetch failed"
+    assert.match(err.message, /\[AZDO\] error de red/);
+    assert.match(err.message, /GET .*\/_apis\/git\/repositories/);
+    assert.match(err.message, /ECONNREFUSED/);
+
+    // La salida legible incluye la causa y sugerencias
+    const readable = String(err);
+    assert.match(readable, /red \/ timeout/i);
+    assert.match(readable, /Causa\s*:.*ECONNREFUSED/);
+    assert.match(readable, /Sugerencias:/);
 
 });

@@ -34,6 +34,11 @@ export interface AzdoErrorDetail {
     eventId: number | null;
     /** Mensajes de la cadena `innerException` aplanada. */
     innerMessages: string[];
+    /**
+     * Causa real de un fallo de conectividad (ej. "ENOTFOUND · getaddrinfo
+     * dev.azure.com"), desenterrada de la cadena `cause` del fetch.
+     */
+    networkCause: string | null;
     method: string | null;
     url: string | null;
     /** Sugerencias accionables en español. */
@@ -202,6 +207,31 @@ const TYPE_RULES: Array<{ test: RegExp; kind: string; hint?: string }> = [
     { test: /quota|limit|throttl/i, kind: "Límite alcanzado", hint: "Reduce la frecuencia de peticiones o el tamaño del payload." }
 ];
 
+/** Códigos de error de red/TLS que pueden aparecer en la cadena `cause` del fetch. */
+const NETWORK_CODES = new Set([
+    "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "EPIPE",
+    "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_SOCKET", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "ERR_TLS_CERT_ALTNAME_INVALID"
+]);
+
+/** Hint accionable por código de red. */
+const NETWORK_HINTS: Record<string, string> = {
+    ENOTFOUND: "El hostname no se pudo resolver (DNS): revisa que baseUrl apunte a la organización correcta y que haya resolución DNS/VPN activa.",
+    EAI_AGAIN: "Fallo temporal de DNS: reintenta; si persiste, revisa los servidores DNS/VPN.",
+    ECONNREFUSED: "Nada escuchó en host:puerto — verifica la URL base, el puerto y que no haya firewall bloqueando la salida.",
+    ECONNRESET: "La conexión fue cortada a mitad de camino: típico de proxies corporativos o VPN inestable.",
+    ETIMEDOUT: "El host no respondió a tiempo: revisa conectividad/latencia hacia dev.azure.com.",
+    UND_ERR_CONNECT_TIMEOUT: "Timeout de conexión del fetch: revisa conectividad o aumenta el timeout.",
+    CERT_HAS_EXPIRED: "El certificado TLS del servidor (o del proxy de inspección) está vencido.",
+    DEPTH_ZERO_SELF_SIGNED_CERT: "Certificado autofirmado interceptando el TLS: agrega la CA corporativa con NODE_EXTRA_CA_CERTS.",
+    SELF_SIGNED_CERT_IN_CHAIN: "Cadena de certificados con CA autofirmada: agrega la CA corporativa con NODE_EXTRA_CA_CERTS.",
+    UNABLE_TO_VERIFY_LEAF_SIGNATURE: "No se pudo verificar el certificado TLS: falta la CA raíz corporativa (NODE_EXTRA_CA_CERTS).",
+    UNABLE_TO_GET_ISSUER_CERT_LOCALLY: "Falta la CA emisora en el almacén local: configura NODE_EXTRA_CA_CERTS con la CA corporativa.",
+    ERR_TLS_CERT_ALTNAME_INVALID: "El certificado TLS no corresponde al hostname: puede haber un proxy inspeccionando el tráfico."
+};
+
 // ---------------------------------------------------------------------------
 // Helpers internos
 // ---------------------------------------------------------------------------
@@ -261,6 +291,29 @@ function dedupe(items: Array<string | null | undefined>): string[] {
     return [...new Set(items.filter((i): i is string => !!i))];
 }
 
+/**
+ * Recorre la cadena `cause` de un error (fetch/undici envuelven la causa real
+ * ahí) y devuelve los códigos de red reconocidos + mensajes útiles.
+ */
+function collectNetworkFailure(err: unknown): { codes: string[]; messages: string[] } {
+    const codes = new Set<string>();
+    const messages: string[] = [];
+    let cur: unknown = err;
+    const seen = new Set<unknown>();
+    while (cur && typeof cur === "object" && !seen.has(cur)) {
+        seen.add(cur);
+        const e = cur as { code?: unknown; message?: unknown; cause?: unknown };
+        if (typeof e.code === "string" && NETWORK_CODES.has(e.code)) codes.add(e.code);
+        if (typeof e.message === "string") {
+            const m = e.message.trim();
+            // Se ignoran los mensajes genéricos del wrapper de fetch
+            if (m && m !== "fetch failed" && !messages.includes(m)) messages.push(m);
+        }
+        cur = e.cause;
+    }
+    return { codes: [...codes], messages };
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -290,6 +343,14 @@ export function parseAzdoError(err: unknown): AzdoErrorDetail | null {
     const errorCode = typeof body.errorCode === "number" ? body.errorCode : null;
     const eventId = typeof body.eventId === "number" ? body.eventId : null;
 
+    // --- causa de red (cadena `cause` del fetch) ---
+    const network = collectNetworkFailure(err);
+    // El mensaje del HttpError de red ya incluye la causa — se ignora para no duplicar
+    const causeMessages = network.messages.filter(m => m !== (typeof err.message === "string" ? err.message : ""));
+    const networkCause = network.codes.length || causeMessages.length
+        ? dedupe([...network.codes, ...causeMessages]).join(" · ")
+        : null;
+
     // --- clasificación: código conocido > reglas de tipo > status ---
     let kind = info?.kind ?? statusLabel(status);
     const haystack = `${typeKey ?? ""} ${typeName ?? ""} ${serverMessage ?? ""}`;
@@ -304,6 +365,7 @@ export function parseAzdoError(err: unknown): AzdoErrorDetail | null {
             const c = extractAzdoCode(m);
             return c && KNOWN_CODES[c] ? KNOWN_CODES[c].hint : null;
         }),
+        ...network.codes.map(c => NETWORK_HINTS[c] ?? null),
         ...(info?.hints ?? [])
     ]);
 
@@ -321,6 +383,7 @@ export function parseAzdoError(err: unknown): AzdoErrorDetail | null {
         errorCode,
         eventId,
         innerMessages,
+        networkCause,
         method: request && typeof request.method === "string" ? request.method : null,
         url: request && typeof request.url === "string" ? request.url : null,
         hints,
@@ -355,6 +418,10 @@ export function formatAzdoError(input: unknown): string {
 
     if (detail.serverMessage) {
         lines.push(`  Mensaje  : ${detail.serverMessage}`);
+    }
+
+    if (detail.networkCause) {
+        lines.push(`  Causa    : ${detail.networkCause}`);
     }
 
     const meta: string[] = [];
@@ -409,6 +476,7 @@ function buildSummaryMessage(detail: AzdoErrorDetail): string {
     parts.push(detail.status === 0 ? "error de red" : `HTTP ${detail.status} ${detail.statusLabel}`);
     if (detail.method && detail.url) parts.push(`${detail.method} ${shortenUrl(detail.url, 100)}`);
     if (detail.serverMessage) parts.push(detail.serverMessage);
+    else if (detail.networkCause) parts.push(detail.networkCause);
     else if (detail.codeSummary) parts.push(detail.codeSummary);
     return `[AZDO] ${parts.join(" — ")}`;
 }

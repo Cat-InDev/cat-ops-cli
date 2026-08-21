@@ -57,6 +57,27 @@ function createHttpError<T>(
     return err;
 }
 
+/**
+ * Describe la causa real de un fallo de red de fetch. Node envuelve el error
+ * verdadero (DNS, conexión rechazada, TLS, ...) en la cadena `cause` y el
+ * mensaje visible es solo "fetch failed" — aquí lo desenterramos.
+ */
+function describeNetworkFailure(error: unknown): string {
+    const parts: string[] = [];
+    let cur: unknown = error;
+    const seen = new Set<unknown>();
+    while (cur && typeof cur === "object" && !seen.has(cur)) {
+        seen.add(cur);
+        const e = cur as { code?: unknown; message?: unknown; cause?: unknown };
+        if (typeof e.code === "string" && e.code) parts.push(e.code);
+        else if (typeof e.message === "string" && e.message.trim() && e.message !== "fetch failed") {
+            parts.push(e.message.trim());
+        }
+        cur = e.cause;
+    }
+    return [...new Set(parts)].join(" · ") || "fallo de red sin detalle";
+}
+
 class HttpService {
 
     private baseUrl = "";
@@ -182,7 +203,18 @@ class HttpService {
                     ctx.request
                 );
             }
-            throw error;
+            // Fallo a nivel de red (DNS, conexión rechazada, TLS, ...): en vez
+            // del opaco "fetch failed", se envuelve como HttpError con status 0
+            // y la causa real en el mensaje (y en .cause para uso programático).
+            const wrapped = createHttpError(
+                `HTTP ${method} ${ctx.request.url} falló antes de recibir respuesta (${describeNetworkFailure(error)})`,
+                0,
+                {},
+                null,
+                ctx.request
+            );
+            (wrapped as { cause?: unknown }).cause = error;
+            throw wrapped;
         }
 
         const responseHeaders = parseHeaders(rawRes.headers);
