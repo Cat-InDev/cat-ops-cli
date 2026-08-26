@@ -541,23 +541,24 @@ export class AzureDevOpsApi {
         repoNameOrId: string,
         branchName: string,
         opts?: AzdoRequestOptions
-    ): Promise<boolean> {
+    ): Promise<HttpResponse<{ exists: boolean; data?: AzdoGitBranch }> > {
         try {
-            const refName = branchName.startsWith("refs/heads/") ? branchName : `refs/heads/${branchName}`;
-            await this.request("GET", `/git/repositories/${encodeURIComponent(repoNameOrId)}/refs/${refName}`, opts);
-            return true;
+            const branch = await this.getBranch(repoNameOrId, branchName, opts);
+            return {...branch, body: { exists: !!branch.body, data: branch.body }};
         } catch (err) {
             if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
-                return false;
+                return { ...err, body: { exists: false }, request: (err as any).request, status: 404, headers: (err as any).headers};
             }
             throw err;
         }
     }
 
     /** Obtiene una branch específica con su último commit. */
-    getBranch(repoNameOrId: string, branchName: string, opts?: AzdoRequestOptions): Promise<HttpResponse<AzdoGitBranch>> {
-        const refName = branchName.startsWith("refs/heads/") ? branchName : `refs/heads/${branchName}`;
-        return this.request("GET", `/git/repositories/${encodeURIComponent(repoNameOrId)}/refs/${refName}`, opts);
+    async getBranch(repoNameOrId: string, branchName: string, opts?: AzdoRequestOptions): Promise<HttpResponse<AzdoGitBranch>> {
+        const refName = branchName.replace(/^refs\//, "").replace(/^heads\//, "");
+        const response = await this.request("GET", `/git/repositories/${encodeURIComponent(repoNameOrId)}/refs`, {...opts, query: { filter: `heads/${refName}` }});
+        const branch = (response.body as Record<string, any>).value.find((b: AzdoGitBranch) => b.name === `refs/heads/${refName}`);
+        return { ...response, body: branch };
     }
 
     // =========================================================================
@@ -742,17 +743,17 @@ export class AzureDevOpsApi {
         project: string | undefined,
         repoName: string,
         opts?: AzdoRequestOptions
-    ): Promise<AzdoGitRepository | undefined> {
+    ): Promise<{ exists: boolean; data?: AzdoGitRepository }> {
         try {
             const res = await this.request<AzdoGitRepository>(
                 "GET",
                 `/git/repositories/${encodeURIComponent(repoName)}`,
                 { ...opts, project: project ?? opts?.project }
             );
-            return res.body;
+            return {exists: true, data: res.body};
         } catch (err) {
             if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
-                return undefined;
+                return {exists: false};
             }
             throw err;
         }
@@ -968,7 +969,7 @@ export class AzureDevOpsApi {
         opts?: AzdoRequestOptions
     ): Promise<AzdoGitRepository> {
         const existing = await this.repoExists(projectId, repository, opts);
-        let repoData = existing;
+        let repoData = existing.data;
 
         if (!existing) {
             const res = await this.createRepository(projectName, projectId, repository, opts);
