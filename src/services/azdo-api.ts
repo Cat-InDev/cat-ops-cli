@@ -873,55 +873,66 @@ export class AzureDevOpsApi {
         },
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<unknown>> {
-        let ref: string | undefined;
-        try {
-            const branch = await this.getBranch(options.repo, options.branch, opts);
-            ref = branch.body?.commit?.commitId;
-        } catch (err) {
-            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
-                ref = undefined;
-            } else {
-                throw err;
+        const maxRetries = 3;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            let ref: string | undefined;
+            try {
+                const branch = await this.getBranch(options.repo, options.branch, opts);
+                ref = branch.body?.commit?.commitId;
+            } catch (err) {
+                if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                    ref = undefined;
+                } else {
+                    throw err;
+                }
             }
-        }
-        const exists = await this.fileExists(options.project, options.repo, options.branch, options.filePath, opts);
-        
-        if(exists && options.override === false) {
-            throw new Error(`File ${options.filePath} already exists in ${options.repo}@${options.branch}. Use override=true to force update.`);
-        }
-        
-        const isBuffer = Buffer.isBuffer(options.fileContent);
-        return this.request(
-            "POST",
-            `/git/repositories/${encodeURIComponent(options.repo)}/pushes`,
-            {
-                ...opts,
-                project: options.project,
-                body: {
-                    refUpdates: [
-                        {
-                            name: `refs/heads/${options.branch}`,
-                            oldObjectId: !ref ? "0000000000000000000000000000000000000000" : ref
-                        }
-                    ],
-                    commits: [
-                        {
-                            comment: options.comment ?? "Automatic update",
-                            changes: [
+            const exists = await this.fileExists(options.project, options.repo, options.branch, options.filePath, opts);
+            
+            if(exists && options.override === false) {
+                throw new Error(`File ${options.filePath} already exists in ${options.repo}@${options.branch}. Use override=true to force update.`);
+            }
+            
+            const isBuffer = Buffer.isBuffer(options.fileContent);
+            try {
+                return await this.request(
+                    "POST",
+                    `/git/repositories/${encodeURIComponent(options.repo)}/pushes`,
+                    {
+                        ...opts,
+                        project: options.project,
+                        body: {
+                            refUpdates: [
                                 {
-                                    changeType: exists ? "edit" : "add",
-                                    item: { path: options.filePath },
-                                    newContent: {
-                                        content: isBuffer ? options.fileContent.toString("base64") : options.fileContent,
-                                        contentType: isBuffer ? "base64Encoded" : "rawtext"
-                                    }
+                                    name: `refs/heads/${options.branch}`,
+                                    oldObjectId: !ref ? "0000000000000000000000000000000000000000" : ref
+                                }
+                            ],
+                            commits: [
+                                {
+                                    comment: options.comment ?? "Automatic update",
+                                    changes: [
+                                        {
+                                            changeType: exists ? "edit" : "add",
+                                            item: { path: options.filePath },
+                                            newContent: {
+                                                content: isBuffer ? options.fileContent.toString("base64") : options.fileContent,
+                                                contentType: isBuffer ? "base64Encoded" : "rawtext"
+                                            }
+                                        }
+                                    ]
                                 }
                             ]
                         }
-                    ]
+                    }
+                );
+            } catch (err) {
+                if (attempt < maxRetries - 1 && err && typeof err === "object" && "status" in err && (err as { status: number }).status === 409) {
+                    continue;
                 }
+                throw err;
             }
-        );
+        }
+        throw new Error("Unreachable");
     }
 
     /**
