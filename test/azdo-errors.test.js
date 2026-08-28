@@ -281,13 +281,13 @@ test("los checks de status === 404 siguen funcionando tras el wrap", async () =>
     try {
         const api = createApi(url);
 
-        // branchExists debe devolver false (el error envuelto conserva .status)
+        // branchExists debe devolver exists: false (el error envuelto conserva .status)
         const exists = await api.branchExists("my-repo", "feature/no-existe");
-        assert.equal(exists, false);
+        assert.equal(exists.body.exists, false);
 
-        // repoExists debe devolver undefined
+        // repoExists debe devolver exists: false
         const repo = await api.repoExists(undefined, "no-existe-repo");
-        assert.equal(repo, undefined);
+        assert.equal(repo.exists, false);
     } finally {
         await new Promise(r => server.close(r));
     }

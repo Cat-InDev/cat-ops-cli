@@ -8,6 +8,8 @@ const { AzureDevOpsApi, HttpService } = require("../dist");
 // Helpers
 // ---------------------------------------------------------------------------
 
+const openServers = new Set();
+
 function createMockServer(routes) {
     return new Promise((resolve) => {
         const server = http.createServer((req, res) => {
@@ -40,14 +42,25 @@ function createMockServer(routes) {
         });
 
         server.listen(0, () => {
+            openServers.add(server);
             resolve({ server, url: `http://localhost:${server.address().port}` });
         });
     });
 }
 
 function closeServer(server) {
+    openServers.delete(server);
+    server.closeAllConnections();
     return new Promise((resolve) => server.close(resolve));
 }
+
+test.after(() => {
+    for (const server of openServers) {
+        server.closeAllConnections();
+        server.close(() => {});
+    }
+    openServers.clear();
+});
 
 function createApi(url) {
     const agent = new HttpService();
@@ -284,18 +297,21 @@ test("listBranches() lista branches de un repo", async () => {
 test("branchExists() devuelve true si la branch existe", async () => {
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/frontend/refs/refs/heads/main": () => ({
-            name: "refs/heads/main", aheadCount: 0, behindCount: 0, isBaseVersion: true,
-            commit: { commitId: "abc", author: { name: "D", email: "d@t.com", date: "" }, committer: { name: "D", email: "d@t.com", date: "" }, comment: "", url: "" }
+        "GET /my-project/_apis/git/repositories/frontend/refs": () => ({
+            value: [{ name: "refs/heads/main", aheadCount: 0, behindCount: 0, isBaseVersion: true,
+                commit: { commitId: "abc", author: { name: "D", email: "d@t.com", date: "" }, committer: { name: "D", email: "d@t.com", date: "" }, comment: "", url: "" }
+            }]
         })
     });
 
-    const api = createApi(url);
-    const exists = await api.branchExists("frontend", "main");
+    try {
+        const api = createApi(url);
+        const exists = await api.branchExists("frontend", "main");
 
-    assert.equal(exists, true);
-
-    await closeServer(server);
+        assert.equal(exists.body.exists, true);
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
@@ -303,31 +319,36 @@ test("branchExists() devuelve false si la branch no existe (404)", async () => {
 
     const { server, url } = await createMockServer({});
 
-    const api = createApi(url);
-    const exists = await api.branchExists("frontend", "nonexistent");
+    try {
+        const api = createApi(url);
+        const exists = await api.branchExists("frontend", "nonexistent");
 
-    assert.equal(exists, false);
-
-    await closeServer(server);
+        assert.equal(exists.body.exists, false);
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
 test("getBranch() obtiene una branch específica", async () => {
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/frontend/refs/refs/heads/feature/login": () => ({
-            name: "refs/heads/feature/login", aheadCount: 3, behindCount: 1, isBaseVersion: false,
-            commit: { commitId: "def456", author: { name: "Dev", email: "d@t.com", date: "" }, committer: { name: "Dev", email: "d@t.com", date: "" }, comment: "feat: login", url: "" }
+        "GET /my-project/_apis/git/repositories/frontend/refs": () => ({
+            value: [{ name: "refs/heads/feature/login", aheadCount: 3, behindCount: 1, isBaseVersion: false,
+                commit: { commitId: "def456", author: { name: "Dev", email: "d@t.com", date: "" }, committer: { name: "Dev", email: "d@t.com", date: "" }, comment: "feat: login", url: "" }
+            }]
         })
     });
 
-    const api = createApi(url);
-    const res = await api.getBranch("frontend", "feature/login");
+    try {
+        const api = createApi(url);
+        const res = await api.getBranch("frontend", "feature/login");
 
-    assert.equal(res.body.name, "refs/heads/feature/login");
-    assert.equal(res.body.aheadCount, 3);
-
-    await closeServer(server);
+        assert.equal(res.body.name, "refs/heads/feature/login");
+        assert.equal(res.body.aheadCount, 3);
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
@@ -883,13 +904,16 @@ test("repoExists() devuelve el repo si existe", async () => {
         })
     });
 
-    const api = createApi(url);
-    const result = await api.repoExists(undefined, "existing-repo");
+    try {
+        const api = createApi(url);
+        const result = await api.repoExists(undefined, "existing-repo");
 
-    assert.equal(result.id, "repo-1");
-    assert.equal(result.name, "existing-repo");
-
-    await closeServer(server);
+        assert.equal(result.exists, true);
+        assert.equal(result.data.id, "repo-1");
+        assert.equal(result.data.name, "existing-repo");
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
@@ -897,12 +921,14 @@ test("repoExists() devuelve undefined si no existe (404)", async () => {
 
     const { server, url } = await createMockServer({});
 
-    const api = createApi(url);
-    const result = await api.repoExists(undefined, "missing-repo");
+    try {
+        const api = createApi(url);
+        const result = await api.repoExists(undefined, "missing-repo");
 
-    assert.equal(result, undefined);
-
-    await closeServer(server);
+        assert.equal(result.exists, false);
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
@@ -1064,8 +1090,8 @@ test("createOrUpdateFile() envía push con changeType add", async () => {
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs/refs/heads/main": () => ({
-            value: [{ name: "refs/heads/main", objectId: "old-sha" }]
+        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
+            value: [{ name: "refs/heads/main", commit: { commitId: "old-sha" } }]
         }),
         "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
             receivedBody = body;
@@ -1097,7 +1123,7 @@ test("createOrUpdateFile() usa changeType edit si el archivo ya existe", async (
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs/refs/heads/main": () => ({
+        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
             value: [{ name: "refs/heads/main", objectId: "old-sha" }]
         }),
         "GET /my-project/_apis/git/repositories/repo-1/items": () => ({
@@ -1135,7 +1161,7 @@ test("createFileInRepo() genera README con template", async () => {
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs/refs/heads/main": () => ({
+        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
             value: [{ name: "refs/heads/main", objectId: "zero" }]
         }),
         "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
@@ -1158,7 +1184,7 @@ test("createFileInRepo() crea archivo normal si no es template", async () => {
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs/refs/heads/main": () => ({
+        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
             value: [{ name: "refs/heads/main", objectId: "zero" }]
         }),
         "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
@@ -1191,11 +1217,8 @@ test("createAndInitRepository() crea repo y lo inicializa si no existe", async (
             createCalled = true;
             return { id: "repo-new", name: "new-repo" };
         },
-        "GET /proj-id/_apis/git/repositories/repo-new/refs/refs/heads/main": () => ({
+        "GET /proj-id/_apis/git/repositories/repo-new/refs": () => ({
             value: [{ name: "refs/heads/main", objectId: "zero" }]
-        }),
-        "GET /proj-id/_apis/git/repositories/repo-new/items": () => ({
-            path: "/README.md"
         }),
         "POST /proj-id/_apis/git/repositories/repo-new/pushes": () => {
             filePushed = true;
@@ -1226,7 +1249,7 @@ test("createAndInitRepository() no crea repo si ya existe", async () => {
             defaultBranch: "refs/heads/main",
             project: { id: "proj-id", name: "P" }
         }),
-        "GET /proj-id/_apis/git/repositories/repo-exists/refs/refs/heads/main": () => ({
+        "GET /proj-id/_apis/git/repositories/repo-exists/refs": () => ({
             value: [{ name: "refs/heads/main", objectId: "zero" }]
         }),
         "POST /proj-id/_apis/git/repositories/repo-exists/pushes": () => ({}),
@@ -1641,13 +1664,15 @@ test("addAgentPoolToProject() crea una queue con el pool existente", async () =>
         }
     });
 
-    const api = createApi(url);
-    const result = await api.addAgentPoolToProject(undefined, "my-pool");
+    try {
+        const api = createApi(url);
+        const result = await api.addAgentPoolToProject(undefined, "my-pool");
 
-    assert.equal(receivedBody.pool.id, 7);
-    assert.equal(result.body.pool.id, 7);
-
-    await closeServer(server);
+        assert.equal(receivedBody.pool.id, 7);
+        assert.equal(result.body.pool.id, 7);
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
@@ -1660,12 +1685,14 @@ test("addAgentPoolToProject() lanza si el pool no existe", async () => {
         })
     });
 
-    const api = createApi(url);
-    await assert.rejects(
-        () => api.addAgentPoolToProject(undefined, "missing-pool"),
-        /not found/i
-    );
-
-    await closeServer(server);
+    try {
+        const api = createApi(url);
+        await assert.rejects(
+            () => api.addAgentPoolToProject(undefined, "missing-pool"),
+            /not found/i
+        );
+    } finally {
+        await closeServer(server);
+    }
 
 });

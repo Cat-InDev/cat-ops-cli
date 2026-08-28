@@ -869,18 +869,14 @@ export class AzureDevOpsApi {
             filePath: string;
             fileContent: string | Buffer;
             comment?: string;
+            override?: boolean; // si es true, ignora si el archivo ya existe y fuerza la creación/actualización
         },
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<unknown>> {
         let ref: string | undefined;
         try {
-            const refName = options.branch.startsWith("refs/heads/") ? options.branch : `refs/heads/${options.branch}`;
-            const branchRes = await this.request<AzdoListResponse<AzdoGitRef>>(
-                "GET",
-                `/git/repositories/${encodeURIComponent(options.repo)}/refs/${refName}`,
-                { ...opts, project: options.project }
-            );
-            ref = branchRes.body?.value?.[0]?.objectId;
+            const branch = await this.getBranch(options.repo, options.branch, opts);
+            ref = branch.body?.commit?.commitId;
         } catch (err) {
             if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
                 ref = undefined;
@@ -889,6 +885,11 @@ export class AzureDevOpsApi {
             }
         }
         const exists = await this.fileExists(options.project, options.repo, options.branch, options.filePath, opts);
+        
+        if(exists && options.override === false) {
+            throw new Error(`File ${options.filePath} already exists in ${options.repo}@${options.branch}. Use override=true to force update.`);
+        }
+        
         const isBuffer = Buffer.isBuffer(options.fileContent);
         return this.request(
             "POST",
@@ -947,7 +948,8 @@ export class AzureDevOpsApi {
                 repo,
                 branch,
                 filePath: `${filePath}/${contentTemplates[fileContent].name}`,
-                fileContent: `# ${repo}\n\nProject repository.`
+                fileContent: `# ${repo}\n\nProject repository.`,
+                override: false
             }, opts);
         }
 
@@ -971,7 +973,7 @@ export class AzureDevOpsApi {
         const existing = await this.repoExists(projectId, repository, opts);
         let repoData = existing.data;
 
-        if (!existing) {
+        if (!existing.exists) {
             const res = await this.createRepository(projectName, projectId, repository, opts);
             repoData = res.body;
         }
