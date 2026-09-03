@@ -571,16 +571,15 @@ export class AzureDevOpsApi {
         opts?: AzdoRequestOptions & { branch?: string; top?: number; skip?: number }
     ): Promise<HttpResponse<AzdoListResponse<AzdoGitCommitRef>>> {
         const branch = opts?.branch ?? "main";
-        const body: Record<string, unknown> = {
-            searchCriteria: {
-                itemVersion: { version: branch, versionType: "branch" },
-                ...(opts?.top !== undefined ? { $top: opts.top } : {}),
-                ...(opts?.skip !== undefined ? { $skip: opts.skip } : {})
-            }
+        const query: Record<string, string | number | boolean | undefined> = {
+            "searchCriteria.itemVersion.version": branch,
+            "searchCriteria.itemVersion.versionType": "branch"
         };
-        return this.request("POST", `/git/repositories/${encodeURIComponent(repoNameOrId)}/commits`, {
+        if (opts?.top !== undefined) query["searchCriteria.$top"] = opts.top;
+        if (opts?.skip !== undefined) query["searchCriteria.$skip"] = opts.skip;
+        return this.request("GET", `/git/repositories/${encodeURIComponent(repoNameOrId)}/commits`, {
             ...opts,
-            body
+            query: { ...query, ...opts?.query }
         });
     }
 
@@ -804,25 +803,46 @@ export class AzureDevOpsApi {
     // Commits — latest
     // =========================================================================
 
-    /** Obtiene el último commit de un repo. Devuelve `null` si no hay commits. */
+    /**
+     * Obtiene el último commit de un repo (o de una branch específica).
+     * Devuelve `null` si no hay commits.
+     */
     async getLatestCommit(
         project: string | undefined,
         repoNameOrId: string,
-        opts?: AzdoRequestOptions
+        opts?: AzdoRequestOptions & { branch?: string }
     ): Promise<{ commitId: string; message: string; date: string; author: { name: string; date: string } } | null> {
-        const res = await this.request<AzdoListResponse<AzdoGitCommitRef>>(
-            "GET",
-            `/git/repositories/${encodeURIComponent(repoNameOrId)}/commits`,
-            { ...opts, project: project ?? opts?.project, query: { $top: 1, ...opts?.query } }
-        );
-        if (!res.body.value.length) return null;
-        const commit = res.body.value[0];
-        return {
-            commitId: commit.commitId,
-            message: commit.comment,
-            date: commit.author.date,
-            author: { name: commit.author.name, date: commit.author.date }
-        };
+        const branch = opts?.branch;
+        const query: Record<string, string | number | boolean | undefined> = { "searchCriteria.$top": 1 };
+        if (branch) {
+            query["searchCriteria.itemVersion.version"] = branch;
+            query["searchCriteria.itemVersion.versionType"] = "branch";
+        }
+        try {
+            const res = await this.request<AzdoListResponse<AzdoGitCommitRef>>(
+                "GET",
+                `/git/repositories/${encodeURIComponent(repoNameOrId)}/commits`,
+                { ...opts, project: project ?? opts?.project, query: { ...query, ...opts?.query } }
+            );
+            if (!res.body.value.length) return null;
+            const commit = res.body.value[0];
+            return {
+                commitId: commit.commitId,
+                message: commit.comment,
+                date: commit.author.date,
+                author: { name: commit.author.name, date: commit.author.date }
+            };
+        } catch (err) {
+            if (
+                branch &&
+                err && typeof err === "object" &&
+                (err as { message?: string }).message &&
+                /could not be resolved|TF401175/.test((err as { message: string }).message)
+            ) {
+                return null;
+            }
+            throw err;
+        }
     }
 
     // =========================================================================
@@ -852,6 +872,13 @@ export class AzureDevOpsApi {
             if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
                 return undefined;
             }
+            if (
+                err && typeof err === "object" &&
+                (err as { message?: string }).message &&
+                /could not be resolved|TF401175/.test((err as { message: string }).message)
+            ) {
+                return undefined;
+            }
             throw err;
         }
     }
@@ -859,6 +886,59 @@ export class AzureDevOpsApi {
     // =========================================================================
     // Files — create / update
     // =========================================================================
+
+    /**
+     * Construye el body de un push (`refUpdates` + `commits`). Reutilizable
+     * por todas las operaciones que escriben en un repo.
+     */
+    private buildPushBody(
+        branch: string,
+        oldObjectId: string | null,
+        commits: Array<{ comment: string; changes: Array<Record<string, unknown>> }>
+    ): Record<string, unknown> {
+        const refName = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
+        return {
+            refUpdates: [
+                {
+                    name: refName,
+                    oldObjectId: oldObjectId ?? "0000000000000000000000000000000000000000"
+                }
+            ],
+            commits
+        };
+    }
+
+    /**
+     * Envía un push de uno o varios cambios en un solo commit. Reutiliza
+     * `getLatestCommit` para resolver de forma automática el head de la branch
+     * y no pedir el commit manualmente.
+     */
+    private async sendPush(
+        options: {
+            project: string | undefined;
+            repository: string;
+            branch: string;
+            comment: string;
+            changes: Array<Record<string, unknown>>;
+        },
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<unknown>> {
+        const latest = await this.getLatestCommit(options.project, options.repository, {
+            ...opts,
+            branch: options.branch
+        });
+        return this.request(
+            "POST",
+            `/git/repositories/${encodeURIComponent(options.repository)}/pushes`,
+            {
+                ...opts,
+                project: options.project,
+                body: this.buildPushBody(options.branch, latest?.commitId ?? null, [
+                    { comment: options.comment, changes: options.changes }
+                ])
+            }
+        );
+    }
 
     /** Crea o actualiza un archivo en una branch (push de un solo archivo). */
     async createOrUpdateFile(
@@ -873,58 +953,34 @@ export class AzureDevOpsApi {
         },
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<unknown>> {
-        const maxRetries = 3;
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            let ref: string | undefined;
-            try {
-                const branch = await this.getBranch(options.repo, options.branch, opts);
-                ref = branch.body?.commit?.commitId;
-            } catch (err) {
-                if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
-                    ref = undefined;
-                } else {
-                    throw err;
+        const exists = await this.fileExists(options.project, options.repo, options.branch, options.filePath, opts);
+
+        if (exists && options.override === false) {
+            throw new Error(`File ${options.filePath} already exists in ${options.repo}@${options.branch}. Use override=true to force update.`);
+        }
+
+        const isBuffer = Buffer.isBuffer(options.fileContent);
+        const changes: Array<Record<string, unknown>> = [
+            {
+                changeType: exists ? "edit" : "add",
+                item: { path: options.filePath },
+                newContent: {
+                    content: isBuffer ? options.fileContent.toString("base64") : options.fileContent,
+                    contentType: isBuffer ? "base64Encoded" : "rawtext"
                 }
             }
-            const exists = await this.fileExists(options.project, options.repo, options.branch, options.filePath, opts);
-            
-            if(exists && options.override === false) {
-                throw new Error(`File ${options.filePath} already exists in ${options.repo}@${options.branch}. Use override=true to force update.`);
-            }
-            
-            const isBuffer = Buffer.isBuffer(options.fileContent);
+        ];
+
+        const maxRetries = 3;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
-                return await this.request(
-                    "POST",
-                    `/git/repositories/${encodeURIComponent(options.repo)}/pushes`,
-                    {
-                        ...opts,
-                        project: options.project,
-                        body: {
-                            refUpdates: [
-                                {
-                                    name: `refs/heads/${options.branch}`,
-                                    oldObjectId: !ref ? "0000000000000000000000000000000000000000" : ref
-                                }
-                            ],
-                            commits: [
-                                {
-                                    comment: options.comment ?? "Automatic update",
-                                    changes: [
-                                        {
-                                            changeType: exists ? "edit" : "add",
-                                            item: { path: options.filePath },
-                                            newContent: {
-                                                content: isBuffer ? options.fileContent.toString("base64") : options.fileContent,
-                                                contentType: isBuffer ? "base64Encoded" : "rawtext"
-                                            }
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    }
-                );
+                return await this.sendPush({
+                    project: options.project,
+                    repository: options.repo,
+                    branch: options.branch,
+                    comment: options.comment ?? "Automatic update",
+                    changes
+                }, opts);
             } catch (err) {
                 if (attempt < maxRetries - 1 && err && typeof err === "object" && "status" in err && (err as { status: number }).status === 409) {
                     continue;
@@ -974,6 +1030,40 @@ export class AzureDevOpsApi {
         }, opts);
     }
 
+    /**
+     * Inicializa un repositorio existente que no tiene branches,
+     * creando un commit inicial con un README en la branch por defecto.
+     * Si el repositorio ya tiene branches, no hace nada.
+     * Si el repositorio no existe, lanza un error.
+     */
+    async initRepo(
+        project: string | undefined,
+        repository: string,
+        opts?: AzdoRequestOptions
+    ): Promise<void> {
+        const repoCheck = await this.repoExists(project, repository, opts);
+        if (!repoCheck.exists) {
+            throw new Error(`Repository ${repository} does not exist.`);
+        }
+
+        await this.initRepoById(project, repoCheck.data!.id, opts);
+    }
+
+    private async initRepoById(
+        project: string | undefined,
+        repoId: string,
+        opts?: AzdoRequestOptions
+    ): Promise<void> {
+        const branches = await this.listBranches(repoId, {
+            ...opts,
+            project: project ?? opts?.project
+        });
+
+        if (branches.body.value.length === 0) {
+            await this.createFileInRepo(project, repoId, "main", "README.md", "/", "$README:TEMPLATE", opts);
+        }
+    }
+
     /** Crea un repositorio y lo inicializa con un README. */
     async createAndInitRepository(
         projectName: string,
@@ -989,8 +1079,7 @@ export class AzureDevOpsApi {
             repoData = res.body;
         }
 
-        const repoId = repoData!.id;
-        await this.createFileInRepo(projectId, repoId, "main", "README.md", "/", "$README:TEMPLATE", opts);
+        await this.initRepoById(projectId, repoData!.id, opts);
 
         return repoData!;
     }
@@ -1000,7 +1089,7 @@ export class AzureDevOpsApi {
     // =========================================================================
 
     /** Hace un push con múltiples cambios (add/edit/delete) en un solo commit. */
-    async pushChanges(
+    pushChanges(
         options: {
             project: string | undefined;
             repository: string;
@@ -1014,48 +1103,13 @@ export class AzureDevOpsApi {
         },
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<unknown>> {
-        let ref: string | undefined;
-        try {
-            const refName = options.branch.startsWith("refs/heads/") ? options.branch : `refs/heads/${options.branch}`;
-            const branchRes = await this.request<AzdoListResponse<AzdoGitRef>>(
-                "GET",
-                `/git/repositories/${encodeURIComponent(options.repository)}/refs/${refName}`,
-                {
-                    ...opts,
-                    project: options.project
-                }
-            );
-            ref = branchRes.body?.value?.[0]?.objectId;
-        } catch (err) {
-            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
-                ref = undefined;
-            } else {
-                throw err;
-            }
-        }
-
-        return this.request(
-            "POST",
-            `/git/repositories/${encodeURIComponent(options.repository)}/pushes`,
-            {
-                ...opts,
-                project: options.project,
-                body: {
-                    refUpdates: [
-                        {
-                            name: `refs/heads/${options.branch}`,
-                            oldObjectId: ref
-                        }
-                    ],
-                    commits: [
-                        {
-                            comment: options.comment,
-                            changes: options.changes
-                        }
-                    ]
-                }
-            }
-        );
+        return this.sendPush({
+            project: options.project,
+            repository: options.repository,
+            branch: options.branch,
+            comment: options.comment,
+            changes: options.changes as Array<Record<string, unknown>>
+        }, opts);
     }
 
     // =========================================================================

@@ -358,11 +358,11 @@ test("getBranch() obtiene una branch específica", async () => {
 
 test("listCommits() lista commits de una branch", async () => {
 
-    let receivedBody = null;
+    let receivedParams = null;
 
     const { server, url } = await createMockServer({
-        "POST /my-project/_apis/git/repositories/frontend/commits": (parsedUrl, body) => {
-            receivedBody = body;
+        "GET /my-project/_apis/git/repositories/frontend/commits": (parsedUrl) => {
+            receivedParams = Object.fromEntries(parsedUrl.searchParams.entries());
             return {
                 count: 1,
                 value: [
@@ -377,8 +377,8 @@ test("listCommits() lista commits de una branch", async () => {
 
     assert.equal(res.status, 200);
     assert.equal(res.body.value[0].commitId, "abc123");
-    assert.equal(receivedBody.searchCriteria.itemVersion.version, "feature/login");
-    assert.equal(receivedBody.searchCriteria.itemVersion.versionType, "branch");
+    assert.equal(receivedParams["searchCriteria.itemVersion.version"], "feature/login");
+    assert.equal(receivedParams["searchCriteria.itemVersion.versionType"], "branch");
 
     await closeServer(server);
 
@@ -386,11 +386,11 @@ test("listCommits() lista commits de una branch", async () => {
 
 test("listCommits() usa 'main' como branch por defecto", async () => {
 
-    let receivedBody = null;
+    let receivedParams = null;
 
     const { server, url } = await createMockServer({
-        "POST /my-project/_apis/git/repositories/frontend/commits": (parsedUrl, body) => {
-            receivedBody = body;
+        "GET /my-project/_apis/git/repositories/frontend/commits": (parsedUrl) => {
+            receivedParams = Object.fromEntries(parsedUrl.searchParams.entries());
             return { count: 0, value: [] };
         }
     });
@@ -398,7 +398,7 @@ test("listCommits() usa 'main' como branch por defecto", async () => {
     const api = createApi(url);
     await api.listCommits("frontend");
 
-    assert.equal(receivedBody.searchCriteria.itemVersion.version, "main");
+    assert.equal(receivedParams["searchCriteria.itemVersion.version"], "main");
 
     await closeServer(server);
 
@@ -1045,6 +1045,31 @@ test("getLatestCommit() devuelve null si no hay commits", async () => {
 
 });
 
+test("getLatestCommit() filtra por branch con searchCriteria.itemVersion", async () => {
+
+    let receivedParams = null;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories/repo-1/commits": (parsedUrl) => {
+            receivedParams = Object.fromEntries(parsedUrl.searchParams.entries());
+            return {
+                value: [{ commitId: "sha-123", comment: "c", author: { name: "Alice", date: "" }, committer: { name: "Alice", date: "" } }]
+            };
+        }
+    });
+
+    const api = createApi(url);
+    const result = await api.getLatestCommit(undefined, "repo-1", { branch: "feature/x" });
+
+    assert.equal(result.commitId, "sha-123");
+    assert.equal(receivedParams["searchCriteria.itemVersion.version"], "feature/x");
+    assert.equal(receivedParams["searchCriteria.itemVersion.versionType"], "branch");
+    assert.equal(receivedParams["searchCriteria.$top"], "1");
+
+    await closeServer(server);
+
+});
+
 // ===========================================================================
 // fileExists()
 // ===========================================================================
@@ -1090,8 +1115,8 @@ test("createOrUpdateFile() envía push con changeType add", async () => {
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
-            value: [{ name: "refs/heads/main", commit: { commitId: "old-sha" } }]
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "old-sha", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
         }),
         "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
             receivedBody = body;
@@ -1123,8 +1148,8 @@ test("createOrUpdateFile() usa changeType edit si el archivo ya existe", async (
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
-            value: [{ name: "refs/heads/main", objectId: "old-sha" }]
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "old-sha", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
         }),
         "GET /my-project/_apis/git/repositories/repo-1/items": () => ({
             path: "/README.md",
@@ -1161,8 +1186,8 @@ test("createFileInRepo() genera README con template", async () => {
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
-            value: [{ name: "refs/heads/main", objectId: "zero" }]
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "zero", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
         }),
         "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
             receivedBody = body;
@@ -1184,8 +1209,8 @@ test("createFileInRepo() crea archivo normal si no es template", async () => {
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs": () => ({
-            value: [{ name: "refs/heads/main", objectId: "zero" }]
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "zero", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
         }),
         "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
             receivedBody = body;
@@ -1217,8 +1242,19 @@ test("createAndInitRepository() crea repo y lo inicializa si no existe", async (
             createCalled = true;
             return { id: "repo-new", name: "new-repo" };
         },
+        "GET /proj-id/_apis/git/repositories/repo-new": () => ({
+            id: "repo-new",
+            name: "new-repo",
+            url: "https://x",
+            defaultBranch: null,
+            project: { id: "proj-id", name: "My Project" }
+        }),
         "GET /proj-id/_apis/git/repositories/repo-new/refs": () => ({
-            value: [{ name: "refs/heads/main", objectId: "zero" }]
+            count: 0,
+            value: []
+        }),
+        "GET /proj-id/_apis/git/repositories/repo-new/commits": () => ({
+            value: [{ commitId: "zero", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
         }),
         "POST /proj-id/_apis/git/repositories/repo-new/pushes": () => {
             filePushed = true;
@@ -1250,7 +1286,11 @@ test("createAndInitRepository() no crea repo si ya existe", async () => {
             project: { id: "proj-id", name: "P" }
         }),
         "GET /proj-id/_apis/git/repositories/repo-exists/refs": () => ({
-            value: [{ name: "refs/heads/main", objectId: "zero" }]
+            count: 1,
+            value: [{ name: "refs/heads/main", objectId: "abc123" }]
+        }),
+        "GET /proj-id/_apis/git/repositories/repo-exists/commits": () => ({
+            value: [{ commitId: "zero", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
         }),
         "POST /proj-id/_apis/git/repositories/repo-exists/pushes": () => ({}),
         "POST /proj-id/_apis/git/repositories": () => {
@@ -1270,6 +1310,92 @@ test("createAndInitRepository() no crea repo si ya existe", async () => {
 });
 
 // ===========================================================================
+// initRepo()
+// ===========================================================================
+
+test("initRepo() inicializa repo sin branches", async () => {
+
+    let filePushed = false;
+
+    const { server, url } = await createMockServer({
+        "GET /proj-id/_apis/git/repositories/my-repo": () => ({
+            id: "repo-id",
+            name: "my-repo",
+            url: "https://x",
+            defaultBranch: null,
+            project: { id: "proj-id", name: "P" }
+        }),
+        "GET /proj-id/_apis/git/repositories/repo-id/refs": () => ({
+            count: 0,
+            value: []
+        }),
+        "GET /proj-id/_apis/git/repositories/repo-id/commits": () => ({
+            value: []
+        }),
+        "POST /proj-id/_apis/git/repositories/repo-id/pushes": () => {
+            filePushed = true;
+            return {};
+        }
+    });
+
+    const api = createApi(url);
+    await api.initRepo("proj-id", "my-repo");
+
+    assert.equal(filePushed, true);
+
+    await closeServer(server);
+
+});
+
+test("initRepo() no inicializa repo que ya tiene branches", async () => {
+
+    let filePushed = false;
+
+    const { server, url } = await createMockServer({
+        "GET /proj-id/_apis/git/repositories/my-repo": () => ({
+            id: "repo-id",
+            name: "my-repo",
+            url: "https://x",
+            defaultBranch: "refs/heads/main",
+            project: { id: "proj-id", name: "P" }
+        }),
+        "GET /proj-id/_apis/git/repositories/repo-id/refs": () => ({
+            count: 1,
+            value: [{ name: "refs/heads/main", objectId: "abc123" }]
+        }),
+        "POST /proj-id/_apis/git/repositories/repo-id/pushes": () => {
+            filePushed = true;
+            return {};
+        }
+    });
+
+    const api = createApi(url);
+    await api.initRepo("proj-id", "my-repo");
+
+    assert.equal(filePushed, false);
+
+    await closeServer(server);
+
+});
+
+test("initRepo() lanza error si el repo no existe", async () => {
+
+    const { server, url } = await createMockServer({});
+
+    const api = createApi(url);
+
+    try {
+        await api.initRepo("proj-id", "no-repo");
+        assert.fail("Should have thrown");
+    } catch (err) {
+        assert.match(err.message, /does not exist/);
+    }
+
+    await closeServer(server);
+
+});
+
+// ===========================================================================
 // pushChanges()
 // ===========================================================================
 
@@ -1278,8 +1404,8 @@ test("pushChanges() envía push con múltiples cambios", async () => {
     let receivedBody = null;
 
     const { server, url } = await createMockServer({
-        "GET /my-project/_apis/git/repositories/repo-1/refs/refs/heads/main": () => ({
-            value: [{ name: "refs/heads/main", objectId: "old-sha" }]
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "old-sha", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
         }),
         "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
             receivedBody = body;
