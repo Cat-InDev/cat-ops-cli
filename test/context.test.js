@@ -62,3 +62,31 @@ test("ctx.run() guarda el resultado en ctx.results", async () => {
     assert.equal(value, 42);
     assert.equal(ctx.results.miTask, 42);
 });
+
+test("ctx.env es la misma referencia que shell.environment", () => {
+    const ctx = Context.current();
+    assert.equal(ctx.env, ctx.services.shell.environment);
+});
+
+test("ctx.env['KEY'] = value se refleja en shell.environment", () => {
+    const ctx = Context.current();
+    ctx.env["TEST_SYNC_KEY"] = "from-ctx";
+    assert.equal(ctx.services.shell.environment["TEST_SYNC_KEY"], "from-ctx");
+    delete ctx.env["TEST_SYNC_KEY"];
+});
+
+test("shell.env() se refleja en ctx.env", () => {
+    const ctx = Context.current();
+    ctx.services.shell.env("TEST_SYNC_KEY_2", "from-shell");
+    assert.equal(ctx.env["TEST_SYNC_KEY_2"], "from-shell");
+    delete ctx.env["TEST_SYNC_KEY_2"];
+});
+
+test("Context.reset() genera un env fresco desvinculado del anterior", () => {
+    const ctx1 = Context.current();
+    ctx1.env["RESET_TEST"] = "before-reset";
+
+    const ctx2 = Context.reset();
+    assert.notEqual(ctx2.env["RESET_TEST"], "before-reset");
+    assert.equal(ctx2.env, ctx2.services.shell.environment);
+});

@@ -32,7 +32,8 @@ class Shell {
         retryDelay: 1000,
         timeout: 0,
         dryRun: false,
-        shell: false
+        shell: false,
+        env: {}
     };
 
     configure(options: ExecOptions = {}): this {
@@ -78,12 +79,16 @@ class Shell {
             const stdout: string[] = [];
             const stderr: string[] = [];
 
+            const spawnEnv = options.env
+                ? { ...this.environment, ...options.env }
+                : this.environment;
+
             const child = spawn(
                 command,
                 args,
                 {
                     cwd: this.cwdPath,
-                    env: this.environment,
+                    env: spawnEnv,
                     shell: options.shell,
                     stdio: ["inherit", "pipe", "pipe"]
                 }
@@ -157,10 +162,10 @@ class Shell {
             args = rawArgs.slice(0, -1) as string[];
         }
 
-        const options: Required<ExecOptions> = {
+        const options = {
             ...this.defaults,
             ...callOptions
-        };
+        } as Required<ExecOptions>;
 
         const attempts = Math.max(1, options.retry);
 

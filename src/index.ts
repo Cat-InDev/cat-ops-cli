@@ -26,6 +26,8 @@ export type {
 export { YamlService } from "./services/yaml";
 export type { YamlPrepareActions } from "./services/yaml";
 
+export * as docker from "./services/docker";
+
 export { http, HttpService, HttpRegistry } from "./services/http";
 export type {
     HttpMethod,

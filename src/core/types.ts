@@ -26,6 +26,8 @@ export interface ExecOptions {
     dryRun?: boolean;
     /** Si se quiere ejecutar comandos en el shell del sistema directamente. Default: false */
     shell?: boolean;
+    /** Variables de entorno adicionales para este llamada. Se fusionan con el entorno actual. */
+    env?: NodeJS.ProcessEnv;
 }
 
 // ---------------------------------------------------------------------------

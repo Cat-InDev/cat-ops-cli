@@ -14,7 +14,7 @@ export class Context {
 
     flags: Record<string, FlagValue> = {};
     params: Record<string, string> = {};
-    env: NodeJS.ProcessEnv = { ...process.env };
+    env: NodeJS.ProcessEnv;
     vars: Record<string, unknown> = {};
     results: Record<string, unknown> = {};
     failures: Array<{ label: string; error: unknown }> = [];
@@ -23,6 +23,10 @@ export class Context {
     notifier: Notifier = new Notifier();
     config: Record<string, unknown> = {};
     state: Record<string, unknown> = {};
+
+    constructor() {
+        this.env = this.services.shell.environment;
+    }
 
     static current(): Context {
         if (!Context.instance) {
@@ -34,6 +38,8 @@ export class Context {
     /** Reinicia el singleton. Útil sobre todo en tests. */
     static reset(): Context {
         Context.instance = new Context();
+        Context.instance.services.shell.environment = { ...process.env };
+        Context.instance.env = Context.instance.services.shell.environment;
         return Context.instance;
     }
 

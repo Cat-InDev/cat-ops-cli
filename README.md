@@ -4,12 +4,12 @@ Framework para pipelines DevOps, escrito en **TypeScript** (100% usable desde Ja
 
 Trae:
 
-- Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente.
+- Un **ExecutionContext** compartido (`flags`, `params`, `env`, `vars`, `results`, `logger`, `services`, `notifier`) para que ninguna task tenga que recibir parámetros manualmente. `ctx.env` está sincronizado con `shell.environment` — cualquier variable que agregues se refleja en todos los comandos.
 - **16 servicios** listos (`shell`, `docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`, `azdo`, `http`, `yaml`) + un **cliente REST API** para Azure DevOps (`AzureDevOpsApi`) + un **motor de pipelines** declarativo con dependencias (`Pipeline`).
 - **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout. Los interceptores también se pueden registrar sobre el agente que integra `AzureDevOpsApi`. Modo TLS inseguro (`insecureTls`) para servidores con certificado autofirmado o CA interna no confiable.
 - **Parser de errores de Azure DevOps**: cada fallo de la REST API se convierte en un `AzdoApiError` legible con el mensaje del servidor, código TF/VS, tipo de excepción y sugerencias accionables (`parseAzdoError` / `formatAzdoError`).
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
-- **retry / timeout / dryRun** en cada comando de shell.
+- **retry / timeout / dryRun / env** en cada comando de shell.
 - Validación cíclica de rollouts de Kubernetes/OpenShift (`waitForDeployment`, `waitForDeploymentGroup`).
 - **Callbacks de éxito/error por tarea** + un sistema de **notificaciones clasificadas por área de TI**, con mensajes personalizables y senders (`log`, `file`, `http`, `webhook`, `websocket`). Incluye `ctx.wrap()` para monitoreo automático de servicios con metadata de servicio/método/argumentos.
 
@@ -254,7 +254,7 @@ await ctx.run(
 
 En ambos casos, además de tus callbacks, el resultado se reporta automáticamente al `ctx.notifier` (ver más abajo) — no hay que llamarlo a mano.
 
-## retry / timeout / dryRun — en shell.exec y en TODOS los servicios
+## retry / timeout / dryRun / env — en shell.exec y en TODOS los servicios
 
 `shell.exec(command, ...args)` sigue aceptando exactamente los mismos argumentos de siempre. Si el último argumento es un objeto plano, se interpreta como opciones **solo para esa llamada**:
 
@@ -265,9 +265,41 @@ await ctx.services.shell.exec("curl", "https://flaky-api.internal", {
     retry: 3,         // reintentos totales (default: 1 = sin retry)
     retryDelay: 1000, // ms entre reintentos
     timeout: 5000,    // ms antes de matar el proceso con SIGTERM
-    dryRun: true       // solo loguea el comando, no lo ejecuta
+    dryRun: true,     // solo loguea el comando, no lo ejecuta
+    env: {            // variables de entorno extra para esta llamada (se fusionan con ctx.env)
+        HTTP_PROXY: "http://proxy:3128"
+    }
 });
 ```
+
+### Variables de entorno (`env`)
+
+`ctx.env` es la **misma referencia** que `shell.environment` — cualquier cambio en uno se refleja en el otro y afecta a **todos** los comandos:
+
+```javascript
+// Global: afecta a TODOS los comandos (docker, kubectl, git, ...)
+ctx.env["DOCKER_CONFIG"] = "/ruta/custom/config";
+ctx.env["DOCKER_BUILDKIT"] = "0";
+
+await ctx.services.docker.build({ image: "app:v1" });  // recibe ambas
+await ctx.services.docker.push("app:v1");              // recibe ambas
+await ctx.services.git.clone("url", "path");           // también las recibe
+```
+
+Para override puntual (por llamada), usá `exec.env` — se **fusiona** con `ctx.env`:
+
+```javascript
+// Solo para esta llamada,叠加 sobre ctx.env
+await ctx.services.docker.build({
+    image: "app:v1",
+    exec: { env: { DOCKER_BUILDKIT: "0" } }
+});
+
+// Equivalente vía shell
+ctx.services.shell.env("DOCKER_CONFIG", "/ruta/config");
+```
+
+La jerarquía es: `process.env` → `ctx.env` (global) → `exec.env` (por llamada).
 
 **Todos los comandos de todos los servicios** (`docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`) aceptan este mismo control, sin que cambie nada de lo que ya usabas:
 
@@ -322,6 +354,75 @@ await ctx.services.tekton.pipelineStart("build-pipeline", { params: { image: "ap
 
 await ctx.services.az.acrBuild({ registry: "miregistro", image: "app:v1" });
 ```
+
+## Docker (`ctx.services.docker`)
+
+`ctx.services.docker` agrupa las operaciones habituales de Docker (`build`, `push`, `tag`, `login`, `pull`, `rm`, `rmi`, `prune`) más utilidades de validación de disco y caché (`systemDf`, `buildxDu`, `validateCache`, `validateSpace`).
+
+```javascript
+// build — `--pull=false/true` y `--no-cache`
+await ctx.services.docker.build({
+    image: "registry/app:v1",
+    context: ".",
+    dockerfile: "Dockerfile",
+    buildArgs: { NODE_ENV: "production" },
+    pull: false,       // docker build --pull=false ...
+    noCache: true,     // ... --no-cache
+    exec: {            // override de env solo para este build
+        env: { DOCKER_BUILDKIT: "0", DOCKER_CONFIG: "/tmp/docker" }
+    }
+});
+
+// Variables de entorno globales para TODOS los comandos docker
+ctx.env["DOCKER_CONFIG"] = "/ruta/custom/config";
+ctx.env["DOCKER_BUILDKIT"] = "0";
+
+await ctx.services.docker.push("registry/app:v1");
+await ctx.services.docker.tag("app:v1", "registry/app:v1");
+await ctx.services.docker.login({ registry, username, password });
+await ctx.services.docker.pull("registry/app:v1");
+
+// rm / rmi — eliminar contenedor / imagen (rm con -f si lo deseas)
+await ctx.services.docker.rm("mycontainer");
+await ctx.services.docker.rm("mycontainer", { force: true });
+await ctx.services.docker.rmi("registry/app:v1");
+
+// prune — docker system prune [-a] [--volumes] [--filter ...]
+await ctx.services.docker.prune({ all: true, volumes: true });
+await ctx.services.docker.prune({ all: true, filter: "until=24h" });
+
+// systemDf — docker system df con tamaños normalizados a bytes
+const usage = await ctx.services.docker.systemDf();
+// → { rows: [{ type: "Images", total, active, size, reclaimable }, ...],
+//     total: { size, reclaimable, ... }, raw }
+console.log(usage.total.size);            // bytes totales ocupados
+console.log(usage.rows[0].reclaimable);   // bytes reclaimables por tipo
+
+// buildxDu — tamaño de la caché de build (buildkit)
+await ctx.services.docker.buildxDu();
+
+// validateCache — cuánto ocupa la caché de build y cuánto es recuperable
+const cache = await ctx.services.docker.validateCache();
+// → { cache, reclaimable, usage }
+
+// validateSpace — compara cada métrica contra umbrales configurados (bytes)
+const { exceeded } = await ctx.services.docker.validateSpace({
+    images:     10 * 1e9,   // 10 GB de imágenes
+    containers: 2 * 1e9,    // 2 GB de contenedores
+    volumes:    5 * 1e9,    // 5 GB de volúmenes
+    buildCache: 3 * 1e9,    // 3 GB de caché de build
+    reclaimable: 6 * 1e9    // 6 GB reclaimables en total
+});
+
+if (exceeded.length) {
+    await ctx.services.docker.prune({ all: true });
+}
+
+// Con throwOnExceeded=true lanza un Error si se supera algún umbral
+await ctx.services.docker.validateSpace({ images: 8 * 1e9 }, undefined, true);
+```
+
+Los umbrales y los tamaños del `systemDf` se expresan en **bytes** (con `parseSize` que normaliza `KB/MB/GB/TB`). Todas las funciones aceptan `exec` (retry/timeout/dryRun) como antes.
 
 ## kubectl / oc: kubeconfig, namespace, retry/timeout, y espera cíclica del rollout
 

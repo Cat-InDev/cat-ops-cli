@@ -144,6 +144,78 @@ test("sin exec, el comportamiento es idéntico al de siempre (retrocompatible)",
 
 });
 
+test("env: exec.env se fusiona con el entorno del proceso al hacer spawn", async () => {
+
+    const cp = require("node:child_process");
+    const originalSpawn = cp.spawn;
+
+    let capturedEnv = null;
+
+    cp.spawn = (cmd, args, opts) => {
+        capturedEnv = opts.env;
+        return originalSpawn("node", ["-e", "process.exit(0)"], opts);
+    };
+
+    await shell.exec("docker", "push", "app:v1", {
+        env: { DOCKER_CONFIG: "/custom/config", DOCKER_BUILDKIT: "0" }
+    });
+
+    cp.spawn = originalSpawn;
+
+    assert.ok(capturedEnv, "se capturó el env");
+    assert.equal(capturedEnv.DOCKER_CONFIG, "/custom/config");
+    assert.equal(capturedEnv.DOCKER_BUILDKIT, "0");
+    assert.ok(Object.keys(capturedEnv).length > 2, "se fusiona con el entorno del proceso");
+
+});
+
+test("env: docker.build con DOCKER_CONFIG y DOCKER_BUILDKIT en exec.env", async () => {
+
+    const cp = require("node:child_process");
+    const originalSpawn = cp.spawn;
+
+    let capturedEnv = null;
+
+    cp.spawn = (cmd, args, opts) => {
+        capturedEnv = opts.env;
+        return originalSpawn("node", ["-e", "process.exit(0)"], opts);
+    };
+
+    await docker.build({
+        image: "app:v1",
+        exec: { env: { DOCKER_CONFIG: "/tmp/docker", DOCKER_BUILDKIT: "0" } }
+    });
+
+    cp.spawn = originalSpawn;
+
+    assert.ok(capturedEnv, "se capturó el env");
+    assert.equal(capturedEnv.DOCKER_CONFIG, "/tmp/docker");
+    assert.equal(capturedEnv.DOCKER_BUILDKIT, "0");
+    assert.ok(Object.keys(capturedEnv).length > 2, "se fusiona con el entorno del proceso");
+
+});
+
+test("env: sin exec.env, el entorno es el del proceso (retrocompatible)", async () => {
+
+    const cp = require("node:child_process");
+    const originalSpawn = cp.spawn;
+
+    let capturedEnv = null;
+
+    cp.spawn = (cmd, args, opts) => {
+        capturedEnv = opts.env;
+        return originalSpawn("node", ["-e", "process.exit(0)"], opts);
+    };
+
+    await docker.push("app:v1");
+
+    cp.spawn = originalSpawn;
+
+    assert.ok(capturedEnv, "se capturó el env");
+    assert.deepEqual(Object.keys(capturedEnv).sort(), Object.keys(process.env).sort(), "sin env override, se usa process.env directamente");
+
+});
+
 test("retry real: docker.push se recupera tras 2 fallos con retry:5 (simulando spawn)", async () => {
 
     const cp = require("node:child_process");
