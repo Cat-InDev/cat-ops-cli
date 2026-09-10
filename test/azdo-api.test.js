@@ -527,6 +527,66 @@ test("createPullRequest() envía POST con el body correcto", async () => {
 
 });
 
+test("createPullRequest() agrega refs/heads automáticamente si no viene", async () => {
+
+    let receivedBody = null;
+
+    const { server, url } = await createMockServer({
+        "POST /my-project/_apis/git/repositories/frontend/pullrequests": (parsedUrl, body) => {
+            receivedBody = body;
+            return {
+                pullRequestId: 100, title: body.title, description: body.description || "",
+                status: "active", createdBy: { name: "Dev", email: "d@t.com", date: "" },
+                creationDate: "", sourceRefName: body.sourceRefName, targetRefName: body.targetRefName,
+                mergeStatus: "succeeded", mergeId: "", url: ""
+            };
+        }
+    });
+
+    const api = createApi(url);
+    await api.createPullRequest("frontend", {
+        sourceRefName: "feature/new",
+        targetRefName: "main",
+        title: "New feature"
+    });
+
+    assert.equal(receivedBody.sourceRefName, "refs/heads/feature/new");
+    assert.equal(receivedBody.targetRefName, "refs/heads/main");
+
+    await closeServer(server);
+
+});
+
+test("createPullRequest() no duplica refs/heads", async () => {
+
+    let receivedBody = null;
+
+    const { server, url } = await createMockServer({
+        "POST /my-project/_apis/git/repositories/frontend/pullrequests": (parsedUrl, body) => {
+            receivedBody = body;
+            return {
+                pullRequestId: 101, title: body.title, description: body.description || "",
+                status: "active", createdBy: { name: "Dev", email: "d@t.com", date: "" },
+                creationDate: "", sourceRefName: body.sourceRefName, targetRefName: body.targetRefName,
+                mergeStatus: "succeeded", mergeId: "", url: ""
+            };
+        }
+    });
+
+    const api = createApi(url);
+    await api.createPullRequest("frontend", {
+        sourceRefName: "refs/heads/feature/new",
+        targetRefName: "heads/main",
+        title: "New feature"
+    });
+
+    assert.equal(receivedBody.sourceRefName, "refs/heads/feature/new");
+    assert.equal(receivedBody.targetRefName, "refs/heads/main");
+
+    await closeServer(server);
+
+});
+
 // ---------------------------------------------------------------------------
 // Build Definitions
 // ---------------------------------------------------------------------------
@@ -994,6 +1054,26 @@ test("createBranch() envía POST con ref update", async () => {
     assert.equal(receivedBody.length, 1);
     assert.equal(receivedBody[0].name, "refs/heads/feature");
     assert.equal(receivedBody[0].newObjectId, "abc123");
+
+    await closeServer(server);
+
+});
+
+test("createBranch() acepta refs/heads/ sin duplicarlo", async () => {
+
+    let receivedBody = null;
+
+    const { server, url } = await createMockServer({
+        "POST /my-project/_apis/git/repositories/repo-1/refs": (_, body) => {
+            receivedBody = body;
+            return [{ name: body[0].name, newObjectId: "abc123" }];
+        }
+    });
+
+    const api = createApi(url);
+    await api.createBranch(undefined, "repo-1", "refs/heads/feature", "abc123");
+
+    assert.equal(receivedBody[0].name, "refs/heads/feature");
 
     await closeServer(server);
 

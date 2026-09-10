@@ -31,7 +31,12 @@ function parseHeaders(raw: Headers): Record<string, string> {
     return headers;
 }
 
-async function parseBody(res: globalThis.Response): Promise<unknown> {
+async function parseBody(
+    res: globalThis.Response,
+    responseType?: HttpRequest["responseType"]
+): Promise<unknown> {
+    if (responseType === "arraybuffer") return res.arrayBuffer();
+    if (responseType === "text") return res.text();
     const contentType = res.headers.get("content-type") ?? "";
     if (contentType.includes("application/json")) {
         return res.json();
@@ -357,7 +362,7 @@ class HttpService {
         }
 
         const responseHeaders = parseHeaders(rawRes.headers);
-        const body = await parseBody(rawRes) as T;
+        const body = await parseBody(rawRes, req.responseType) as T;
 
         const response: HttpResponse<T> = {
             status: rawRes.status,

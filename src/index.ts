@@ -66,8 +66,13 @@ export type {
     AzdoServiceEndpoint,
     AzdoGitRef,
     AzdoGitTag,
-    AzdoGitItem
+    AzdoGitItem,
+    AzdoGitChange,
+    AzdoMergeResult
 } from "./services/azdo-api";
+
+export { RepositoryWorkspace, isTextFile, shouldOmit, loadRepositoryZip } from "./services/azdo-workspace";
+export type { WorkspaceFile } from "./services/azdo-workspace";
 
 export { AzdoApiError, parseAzdoError, formatAzdoError } from "./services/azdo-errors";
 export type { AzdoErrorDetail, AzdoErrorBody } from "./services/azdo-errors";

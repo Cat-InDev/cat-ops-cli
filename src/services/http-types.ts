@@ -9,6 +9,12 @@ export interface HttpRequest {
     body?: unknown;
     query?: Record<string, string | number | boolean | undefined>;
     timeout?: number;
+    /**
+     * Formato de la respuesta esperada. Por defecto se detecta por
+     * `content-type` (JSON → objeto, resto → texto). Usa `"arraybuffer"`
+     * para respuestas binarias (ZIP, imágenes, ...).
+     */
+    responseType?: "json" | "text" | "arraybuffer";
     /** Override por-petición: desactiva la validación del certificado TLS. */
     insecureTls?: boolean;
     exec?: ExecOptions;

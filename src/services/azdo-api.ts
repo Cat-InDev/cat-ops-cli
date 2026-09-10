@@ -2,6 +2,12 @@ import type { HttpRequest, HttpResponse, RequestInterceptor, ResponseInterceptor
 import type { ExecOptions } from "../core/types";
 import { HttpService } from "./http";
 import { toAzdoApiError } from "./azdo-errors";
+import {
+    RepositoryWorkspace,
+    loadRepositoryZip,
+    shouldOmit,
+    type WorkspaceFile
+} from "./azdo-workspace";
 
 // Agente HTTP usable por AzureDevOpsApi. Además de `request`, puede exponer
 // los métodos de interceptores y configuración de HttpService — si no los
@@ -66,6 +72,8 @@ export interface AzdoRequestOptions {
     query?: Record<string, string | number | boolean | undefined>;
     /** Override por-llamada: desactiva la validación del certificado TLS. */
     insecureTls?: boolean;
+    /** Formato de respuesta esperado (binario para ZIP, etc.). */
+    responseType?: "json" | "text" | "arraybuffer";
     /** Opciones de exec (dryRun, retry, timeout). */
     exec?: ExecOptions;
     /** Si es true, omite el project de la URL (para endpoints de organización). */
@@ -275,6 +283,22 @@ export interface AzdoGitItem {
     contentType?: string;
 }
 
+/** Cambio individual de un push (add / edit / delete). */
+export interface AzdoGitChange {
+    changeType: "add" | "edit" | "delete";
+    item: { path: string };
+    newContent?: {
+        content: string;
+        contentType: "rawtext" | "base64Encoded";
+    };
+}
+
+/** Resultado de `mergeWithTemplate`. */
+export interface AzdoMergeResult {
+    message: string;
+    changes: AzdoGitChange[];
+}
+
 // ---------------------------------------------------------------------------
 // AzureDevOpsApi
 // ---------------------------------------------------------------------------
@@ -464,6 +488,17 @@ export class AzureDevOpsApi {
         return opts?.apiVersion ?? this.apiVersion;
     }
 
+    /**
+     * Normaliza un nombre de branch al ref completo `refs/heads/<branch>`.
+     * Acepta `"main"`, `"heads/main"` o `"refs/heads/main"` indistintamente,
+     * evitando doble prefijo.
+     */
+    private toRefName(branch: string): string {
+        if (branch.startsWith("refs/heads/")) return branch;
+        const clean = branch.replace(/^refs\//, "").replace(/^heads\//, "");
+        return clean ? `refs/heads/${clean}` : branch;
+    }
+
     // ---- internal request helper ----
 
     async request<T = unknown>(
@@ -486,6 +521,7 @@ export class AzureDevOpsApi {
                     ...opts?.query
                 },
                 insecureTls: opts?.insecureTls,
+                responseType: opts?.responseType,
                 exec: opts?.exec
             });
         } catch (err) {
@@ -616,7 +652,11 @@ export class AzureDevOpsApi {
     ): Promise<HttpResponse<AzdoGitPullRequest>> {
         return this.request("POST", `/git/repositories/${encodeURIComponent(repoNameOrId)}/pullrequests`, {
             ...opts,
-            body: pr
+            body: {
+                ...pr,
+                sourceRefName: this.toRefName(pr.sourceRefName),
+                targetRefName: this.toRefName(pr.targetRefName)
+            }
         });
     }
 
@@ -791,7 +831,7 @@ export class AzureDevOpsApi {
             project: project ?? opts?.project,
             body: [
                 {
-                    name: `refs/heads/${branchName}`,
+                    name: this.toRefName(branchName),
                     newObjectId: fromObjectId,
                     oldObjectId: "0000000000000000000000000000000000000000"
                 }
@@ -1116,7 +1156,7 @@ export class AzureDevOpsApi {
     // Templates — download + merge
     // =========================================================================
 
-    /** Descarga un repositorio completo como buffer ZIP. */
+    /** Descarga un repositorio completo como ZIP y lo devuelve como workspace. */
     async downloadRepositoryZip(
         options: {
             project: string;
@@ -1125,22 +1165,182 @@ export class AzureDevOpsApi {
             scopePath?: string;
         },
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<unknown>> {
-        const path = options.scopePath ?? "/";
-        return this.request("GET", `/git/repositories/${encodeURIComponent(options.repository)}/items`, {
-            ...opts,
-            project: options.project,
-            query: {
-                path,
-                "versionDescriptor[versionOptions]": 0,
-                "versionDescriptor[versionType]": 0,
-                "versionDescriptor[version]": options.branch,
-                resolveLfs: true,
-                "$format": "zip",
-                download: true,
-                ...opts?.query
+    ): Promise<RepositoryWorkspace> {
+        const res = await this.request<ArrayBuffer>(
+            "GET",
+            `/git/repositories/${encodeURIComponent(options.repository)}/items`,
+            {
+                ...opts,
+                project: options.project,
+                responseType: "arraybuffer",
+                query: {
+                    path: options.scopePath ?? "/",
+                    "versionDescriptor[versionOptions]": 0,
+                    "versionDescriptor[versionType]": 0,
+                    "versionDescriptor[version]": options.branch,
+                    resolveLfs: true,
+                    "$format": "zip",
+                    download: true,
+                    ...opts?.query
+                }
             }
+        );
+        return loadRepositoryZip(Buffer.from(res.body));
+    }
+
+    /**
+     * Descarga el workspace de destino tratándolo como si fuera una base
+     * sobre la que aplicar el template. Si la branch no existe todavía
+     * (repo recién creado sin commits), devuelve un workspace vacío.
+     */
+    private async downloadWorkspaceOrEmpty(
+        options: {
+            project: string;
+            repository: string;
+            branch: string;
+            scopePath?: string;
+        },
+        opts?: AzdoRequestOptions
+    ): Promise<RepositoryWorkspace> {
+        try {
+            return await this.downloadRepositoryZip(options, opts);
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err && (err as { status?: number }).status === 404) {
+                return new RepositoryWorkspace();
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * Copia los archivos del template (`source`) sobre el workspace destino.
+     * Con `overwrite: false` no pisa archivos existentes; con
+     * `deleteExtra: true` elimina del destino los archivos que no existen
+     * en el template.
+     */
+    copyWorkspace(
+        options: {
+            source: RepositoryWorkspace;
+            destination: RepositoryWorkspace;
+            overwrite?: boolean;
+            deleteExtra?: boolean;
+            omit?: string[];
+        }
+    ): void {
+        const { source, destination, overwrite = true, deleteExtra = false } = options;
+        if (deleteExtra) {
+            for (const path of destination.listPaths()) {
+                if (!source.has(path)) {
+                    destination.delete(path);
+                }
+            }
+        }
+        for (const file of source.files.values()) {
+            if (shouldOmit(file.path, options.omit)) continue;
+            if (!overwrite && destination.has(file.path)) continue;
+            destination.set({ path: file.path, content: Buffer.from(file.content), binary: file.binary });
+        }
+    }
+
+    /** Aplica una transformación a cada archivo del workspace (en memoria). */
+    async transformWorkspace(
+        workspace: RepositoryWorkspace,
+        transform: (file: WorkspaceFile) => void | Promise<void>
+    ): Promise<void> {
+        for (const file of workspace.files.values()) {
+            await transform(file);
+        }
+    }
+
+    /**
+     * Compara dos workspaces y devuelve los cambios necesarios para dejar
+     * `original` igual a `modified` (add / edit / delete), listos para
+     * enviarlos por `pushChanges`.
+     */
+    compareWorkspaces(
+        original: RepositoryWorkspace,
+        modified: RepositoryWorkspace
+    ): AzdoGitChange[] {
+        const changes: AzdoGitChange[] = [];
+
+        for (const file of modified.files.values()) {
+            const previous = original.get(file.path);
+            const newContent: AzdoGitChange["newContent"] = {
+                content: file.binary ? file.content.toString("base64") : file.content.toString(),
+                contentType: file.binary ? "base64Encoded" : "rawtext"
+            };
+            if (!previous) {
+                changes.push({ changeType: "add", item: { path: file.path }, newContent });
+                continue;
+            }
+            if (Buffer.compare(previous.content, file.content) === 0) continue;
+            changes.push({ changeType: "edit", item: { path: file.path }, newContent });
+        }
+
+        for (const path of original.listPaths()) {
+            if (!modified.has(path)) {
+                changes.push({ changeType: "delete", item: { path } });
+            }
+        }
+
+        return changes;
+    }
+
+    /**
+     * Basa un repositorio en otro (template): descarga ambos, copia los
+     * archivos del template sobre el destino —respetando `overwrite`,
+     * `deleteExtra` y `filters.omit`—, aplica opcionalmente una
+     * transformación y publica los cambios resultantes en un único commit.
+     * Si no hay diferencias, no hace push.
+     */
+    async mergeWithTemplate(
+        options: {
+            project: string;
+            repository: string;
+            targetBranch: string;
+            template: { project: string; repository: string; branch: string };
+            filters?: { omit?: string[] };
+            overwrite?: boolean;
+            deleteExtra?: boolean;
+            transform?: (file: WorkspaceFile) => void | Promise<void>;
+            comment?: string;
+        },
+        opts?: AzdoRequestOptions
+    ): Promise<AzdoMergeResult> {
+        const templateWorkspace = await this.downloadRepositoryZip(options.template, opts);
+        const originalWorkspace = await this.downloadWorkspaceOrEmpty(
+            { project: options.project, repository: options.repository, branch: options.targetBranch },
+            opts
+        );
+
+        const mergedWorkspace = originalWorkspace.clone();
+
+        this.copyWorkspace({
+            source: templateWorkspace,
+            destination: mergedWorkspace,
+            overwrite: options.overwrite,
+            deleteExtra: options.deleteExtra,
+            omit: options.filters?.omit
         });
+
+        if (options.transform) {
+            await this.transformWorkspace(mergedWorkspace, options.transform);
+        }
+
+        const changes = this.compareWorkspaces(originalWorkspace, mergedWorkspace);
+        if (changes.length === 0) {
+            return { message: "No changes", changes };
+        }
+
+        await this.pushChanges({
+            project: options.project,
+            repository: options.repository,
+            branch: options.targetBranch,
+            comment: options.comment ?? "Automatic CI/CD configuration",
+            changes
+        }, opts);
+
+        return { message: `Applied ${changes.length} changes`, changes };
     }
 
     // =========================================================================

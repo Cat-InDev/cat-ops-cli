@@ -1,6 +1,6 @@
 {
   "name": "@cat-indev/catops-cli",
-  "version": "0.0.1-alpha.26",
+  "version": "0.0.1-alpha.28",
   "description": "Framework CLI para pipelines DevOps (shell, docker, git, kubectl, helm, npm, terraform, ansible, argocd, tekton, oc, az) sobre un ExecutionContext compartido, con menus interactivos y selectores automaticos por flag. Escrito en TypeScript, 100% usable desde JavaScript.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -57,6 +57,7 @@
   },
   "license": "MIT",
   "dependencies": {
+    "jszip": "^3.10.2",
     "lodash": "^4.18.1",
     "yaml": "^2.9.0"
   }
