@@ -611,12 +611,22 @@ const repos = await azdo.listRepos();
 const repo  = await azdo.getRepo("frontend");
 ```
 
+### Archivos
+
+```typescript
+const file = await azdo.fileExists("mi-proyecto", "frontend", "main", "/src/index.ts");
+// → { exists: true, data } si existe · { exists: false } si no
+
+await azdo.createFileInRepo("mi-proyecto", "frontend", "main", "README.md", "/", "$README:TEMPLATE");
+// crea solo si no existe; usa overrideFileInRepo() para sobrescribir
+```
+
 ### Branches
 
 ```typescript
 const branches = await azdo.listBranches("frontend");
 
-const exists = await azdo.branchExists("frontend", "feature/login");  // true | false
+const exists = await azdo.branchExists("frontend", "feature/login");  // → exists.body.exists → true | false
 
 const branch = await azdo.getBranch("frontend", "feature/login");
 // → branch.body.aheadCount, .behindCount, .commit.commitId, ...
@@ -640,6 +650,8 @@ const newPr = await azdo.createPullRequest("frontend", {
     title: "feat: login",
     description: "Agrega pantalla de login"
 });
+// Si ya existe un PR activo con la misma fuente/destino, no lanza el error 409:
+// devuelve el PR existente con newPr.body.exists === true.
 ```
 
 ### Build Definitions & Builds
@@ -734,7 +746,7 @@ Qué aporta cada pieza:
 
 Notas:
 
-- El error conserva `status`, `headers`, `body` y `request` del error HTTP original, así que los checks tipo `err.status === 404` siguen funcionando igual que siempre (y helpers como `branchExists()`/`repoExists()` no cambian).
+- El error conserva `status`, `headers`, `body` y `request` del error HTTP original, así que los checks tipo `err.status === 404` siguen funcionando igual que siempre. Los helpers de existencia (`branchExists()`, `repoExists()`, `fileExists()`, `webhookExists()`) devuelven una propiedad `exists` en lugar de lanzar: `branchExists()` la expone en `body.exists`, y `repoExists()`/`fileExists()`/`webhookExists()` en `result.exists` (con `result.data` cuando existe).
 - Detecta códigos TF/VS conocidos (`TF400813`, `TF401019`, `TF401027`, `TF401320`, `VS800075`, ...) con explicación y sugerencia específica; los desconocidos caen a sugerencias por status HTTP (401 → PAT expirado/org incorrecta, 404 → puede ser falta de permisos, 409 → `oldObjectId` desactualizado, 429 → throttling, etc.).
 - Aplana la cadena `innerException` del servidor en `detail.innerMessages`.
 - Soporta cuerpos no-JSON (proxies que devuelven HTML) y clasifica errores de red/timeout (`status: 0`) como `Red / Timeout`.

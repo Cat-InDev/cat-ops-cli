@@ -644,20 +644,81 @@ export class AzureDevOpsApi {
         return this.request("GET", `/git/repositories/${encodeURIComponent(repoNameOrId)}/pullrequests/${pullRequestId}`, opts);
     }
 
-    /** Crea un pull request. */
-    createPullRequest(
+    /**
+     * Busca el PR activo que ya exista con la misma fuente/destino.
+     * Devuelve `undefined` si no existe.
+     */
+    private async findPullRequest(
+        repoNameOrId: string,
+        sourceRefName: string,
+        targetRefName: string,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoGitPullRequest> | undefined> {
+        try {
+            const res = await this.request<AzdoListResponse<AzdoGitPullRequest>>(
+                "GET",
+                `/git/repositories/${encodeURIComponent(repoNameOrId)}/pullrequests`,
+                {
+                    ...opts,
+                    query: {
+                        status: "active",
+                        "searchCriteria.sourceRefName": sourceRefName,
+                        "searchCriteria.targetRefName": targetRefName,
+                        ...opts?.query
+                    }
+                }
+            );
+            const pr = res.body.value.find(
+                p => p.status === "active" && p.sourceRefName === sourceRefName && p.targetRefName === targetRefName
+            );
+            return pr ? { ...res, body: pr } : undefined;
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                return undefined;
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * Crea un pull request. Si ya existe un PR activo con la misma fuente
+     * (sourceRefName) y destino (targetRefName), no lanza el error 409 de
+     * Azure: devuelve el PR existente con `exists: true` en el body.
+     */
+    async createPullRequest(
         repoNameOrId: string,
         pr: { sourceRefName: string; targetRefName: string; title: string; description?: string },
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<AzdoGitPullRequest>> {
-        return this.request("POST", `/git/repositories/${encodeURIComponent(repoNameOrId)}/pullrequests`, {
-            ...opts,
-            body: {
-                ...pr,
-                sourceRefName: this.toRefName(pr.sourceRefName),
-                targetRefName: this.toRefName(pr.targetRefName)
+    ): Promise<HttpResponse<AzdoGitPullRequest & { exists: boolean }>> {
+        const sourceRefName = this.toRefName(pr.sourceRefName);
+        const targetRefName = this.toRefName(pr.targetRefName);
+
+        const existing = await this.findPullRequest(repoNameOrId, sourceRefName, targetRefName, opts);
+        if (existing) {
+            return { ...existing, body: { ...existing.body, exists: true } };
+        }
+
+        try {
+            const res = await this.request<AzdoGitPullRequest>(
+                "POST",
+                `/git/repositories/${encodeURIComponent(repoNameOrId)}/pullrequests`,
+                { ...opts, body: { ...pr, sourceRefName, targetRefName } }
+            );
+            return { ...res, body: { ...res.body, exists: false } };
+        } catch (err) {
+            // Race: entre el pre-check y el POST alguien creó el PR. Azure
+            // responde 409/400; lo traducimos al PR existente en vez de fallar.
+            if (err && typeof err === "object" && "status" in err) {
+                const status = (err as { status: number }).status;
+                if (status === 409 || status === 400) {
+                    const found = await this.findPullRequest(repoNameOrId, sourceRefName, targetRefName, opts);
+                    if (found) {
+                        return { ...found, body: { ...found.body, exists: true } };
+                    }
+                }
             }
-        });
+            throw err;
+        }
     }
 
     // =========================================================================
@@ -889,14 +950,17 @@ export class AzureDevOpsApi {
     // Files — existence check
     // =========================================================================
 
-    /** Verifica si un archivo existe en una branch. Devuelve el item o `undefined`. */
+    /**
+     * Verifica si un archivo existe en una branch.
+     * Devuelve `{ exists: true, data }` si existe, `{ exists: false }` si no.
+     */
     async fileExists(
         project: string | undefined,
         repoName: string,
         branchName: string,
         filePath: string,
         opts?: AzdoRequestOptions
-    ): Promise<AzdoGitItem | undefined> {
+    ): Promise<{ exists: boolean; data?: AzdoGitItem }> {
         try {
             const res = await this.request<AzdoGitItem>(
                 "GET",
@@ -907,17 +971,17 @@ export class AzureDevOpsApi {
                     query: { path: filePath, "versionDescriptor.version": branchName, ...opts?.query }
                 }
             );
-            return res.body;
+            return { exists: true, data: res.body };
         } catch (err) {
             if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
-                return undefined;
+                return { exists: false };
             }
             if (
                 err && typeof err === "object" &&
                 (err as { message?: string }).message &&
                 /could not be resolved|TF401175/.test((err as { message: string }).message)
             ) {
-                return undefined;
+                return { exists: false };
             }
             throw err;
         }
@@ -993,16 +1057,16 @@ export class AzureDevOpsApi {
         },
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<unknown>> {
-        const exists = await this.fileExists(options.project, options.repo, options.branch, options.filePath, opts);
+        const file = await this.fileExists(options.project, options.repo, options.branch, options.filePath, opts);
 
-        if (exists && options.override === false) {
+        if (file.exists && options.override === false) {
             throw new Error(`File ${options.filePath} already exists in ${options.repo}@${options.branch}. Use override=true to force update.`);
         }
 
         const isBuffer = Buffer.isBuffer(options.fileContent);
         const changes: Array<Record<string, unknown>> = [
             {
-                changeType: exists ? "edit" : "add",
+                changeType: file.exists ? "edit" : "add",
                 item: { path: options.filePath },
                 newContent: {
                     content: isBuffer ? options.fileContent.toString("base64") : options.fileContent,
@@ -1032,9 +1096,29 @@ export class AzureDevOpsApi {
     }
 
     /**
-     * Crea un archivo en un repo. Si el contenido es una de las plantillas
-     * conocidas (ej. `$README:TEMPLATE`), genera un README.md con el contenido
-     * por defecto.
+     * Resuelve la ruta y el contenido final de un archivo a crear.
+     * Si `fileContent` es una plantilla conocida (ej. `$README:TEMPLATE`),
+     * genera un README.md con el contenido por defecto.
+     */
+    private resolveFileTarget(
+        repo: string,
+        fileName: string,
+        filePath: string,
+        fileContent: string
+    ): { path: string; content: string } {
+        const contentTemplates: Record<string, { name: string }> = {
+            "$README:TEMPLATE": { name: "README.md" }
+        };
+        const template = contentTemplates[fileContent];
+        const path = `${filePath}/${template ? template.name : fileName}`.replace(/\/+/g, "/");
+        const content = template ? `# ${repo}\n\nProject repository.` : fileContent;
+        return { path, content };
+    }
+
+    /**
+     * Crea un archivo en un repo SOLO si no existe: si ya existe no lo crea,
+     * no lo reemplaza ni falla (devuelve `undefined`). Para sobrescribirlo,
+     * usa `overrideFileInRepo`.
      */
     async createFileInRepo(
         project: string | undefined,
@@ -1044,29 +1128,46 @@ export class AzureDevOpsApi {
         filePath: string,
         fileContent: string,
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<unknown>> {
-        const contentTemplates: Record<string, { name: string; type: string }> = {
-            "$README:TEMPLATE": { name: "README.md", type: "readme" }
-        };
+    ): Promise<HttpResponse<unknown> | undefined> {
+        const { path, content } = this.resolveFileTarget(repo, fileName, filePath, fileContent);
 
-        if (contentTemplates[fileContent]) {
-            return this.createOrUpdateFile({
-                project,
-                repo,
-                branch,
-                filePath: `${filePath}/${contentTemplates[fileContent].name}`,
-                fileContent: `# ${repo}\n\nProject repository.`,
-                override: false
-            }, opts);
-        }
+        const file = await this.fileExists(project, repo, branch, path, opts);
+        if (file.exists) return undefined;
 
         return this.createOrUpdateFile({
             project,
             repo,
             branch,
-            filePath: `${filePath}/${fileName}`.replace(/\/+/g, "/"),
-            fileContent,
-            comment: "Automated by prepare ci/cd process"
+            filePath: path,
+            fileContent: content,
+            comment: "Automated by prepare ci/cd process",
+            override: true
+        }, opts);
+    }
+
+    /**
+     * Fuerza la creación/sobrescritura de un archivo en un repo aunque ya
+     * exista (usa `changeType` edit si existe, add si no).
+     */
+    async overrideFileInRepo(
+        project: string | undefined,
+        repo: string,
+        branch: string,
+        fileName: string,
+        filePath: string,
+        fileContent: string,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<unknown>> {
+        const { path, content } = this.resolveFileTarget(repo, fileName, filePath, fileContent);
+
+        return this.createOrUpdateFile({
+            project,
+            repo,
+            branch,
+            filePath: path,
+            fileContent: content,
+            comment: "Automated by prepare ci/cd process",
+            override: true
         }, opts);
     }
 
@@ -1346,15 +1447,17 @@ export class AzureDevOpsApi {
     // =========================================================================
     // Webhooks
     // =========================================================================
-
-    /** Verifica si existe un webhook de push para un repo/branch/URL dados. */
+/**
+     * Verifica si existe un webhook de push para un repo/branch/URL dados.
+     * Devuelve `{ exists: true, data }` si existe, `{ exists: false }` si no.
+     */
     async webhookExists(
         projectId: string,
         repositoryId: string,
         branchName: string,
         webhookUrl: string,
         opts?: AzdoRequestOptions
-    ): Promise<AzdoWebHookSubscription | undefined> {
+    ): Promise<{ exists: boolean; data?: AzdoWebHookSubscription }> {
         try {
             const res = await this.request<{ results: AzdoWebHookSubscription[] }>(
                 "POST",
@@ -1368,6 +1471,7 @@ export class AzureDevOpsApi {
                         publisherInputFilters: [
                             {
                                 conditions: [
+
                                     { inputId: "projectId", operator: 0, inputValue: projectId }
                                 ]
                             }
@@ -1375,14 +1479,15 @@ export class AzureDevOpsApi {
                     }
                 }
             );
-            return res.body.results.find(
+            const found = res.body.results.find(
                 e => e.publisherInputs.projectId === projectId
                     && e.publisherInputs.repository === repositoryId
                     && e.publisherInputs.branch === branchName
                     && e.consumerInputs.url === webhookUrl
             );
+            return found ? { exists: true, data: found } : { exists: false };
         } catch {
-            return undefined;
+            return { exists: false };
         }
     }
 
@@ -1735,12 +1840,11 @@ export class AzureDevOpsApi {
     // Agent Pools
     // =========================================================================
 
-    /** Asocia un agent pool existente a un proyecto (crea una queue). */
-    async addAgentPoolToProject(
-        project: string | undefined,
+    /** Busca un agent pool por nombre a nivel de organización. */
+    private async findAgentPool(
         agentPoolName: string,
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<AzdoAgentQueue>> {
+    ): Promise<AzdoAgentPool> {
         const poolsRes = await this.request<AzdoListResponse<AzdoAgentPool>>(
             "GET",
             "/distributedtask/pools",
@@ -1754,14 +1858,97 @@ export class AzureDevOpsApi {
         if (!pool) {
             throw new Error(`Agent Pool '${agentPoolName}' not found.`);
         }
+        return pool;
+    }
 
+    /**
+     * Busca la queue del proyecto que ya usa un pool, si existe.
+     * Devuelve `{ exists: true, data }` con la queue, o `{ exists: false }`.
+     */
+    private async findAgentPoolQueue(
+        project: string | undefined,
+        poolId: number,
+        agentPoolName: string,
+        opts?: AzdoRequestOptions
+    ): Promise<{ exists: boolean; data?: HttpResponse<AzdoAgentQueue> }> {
+        try {
+            const queuesRes = await this.request<AzdoListResponse<AzdoAgentQueue>>(
+                "GET",
+                "/distributedtask/queues",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    apiVersion: "7.1-preview.1"
+                }
+            );
+            const queue = queuesRes.body.value.find(q => q.pool?.id === poolId || q.name === agentPoolName);
+            return queue ? { exists: true, data: { ...queuesRes, body: queue } } : { exists: false };
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                return { exists: false };
+            }
+            throw err;
+        }
+    }
+
+    /** Crea la queue que asocia un pool a un proyecto. */
+    private createAgentQueue(
+        project: string | undefined,
+        agentPoolName: string,
+        poolId: number,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoAgentQueue>> {
         return this.request("POST", "/distributedtask/queues", {
             ...opts,
             project: project ?? opts?.project,
             apiVersion: "7.1-preview.1",
             query: { authorizePipelines: true, ...opts?.query },
-            body: { name: agentPoolName, pool: { id: pool.id } }
+            body: { name: agentPoolName, pool: { id: poolId } }
         });
+    }
+
+    /**
+     * Asocia un agent pool existente a un proyecto (crea una queue).
+     * Si la queue ya existe, la devuelve tal cual: no crea otra, no la
+     * reemplaza y no produce error 40X.
+     */
+    async addAgentPoolToProject(
+        project: string | undefined,
+        agentPoolName: string,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoAgentQueue>> {
+        const pool = await this.findAgentPool(agentPoolName, opts);
+
+        const existing = await this.findAgentPoolQueue(project, pool.id, agentPoolName, opts);
+        if (existing.exists) return existing.data!;
+
+        return this.createAgentQueue(project, agentPoolName, pool.id, opts);
+    }
+
+    /**
+     * Fuerza la creación de la queue del pool en el proyecto (sin pre-chequeo).
+     * Si Azure responde 409/400 porque la queue ya existe, devuelve la queue
+     * existente en lugar de fallar.
+     */
+    async overrideAgentPoolToProject(
+        project: string | undefined,
+        agentPoolName: string,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoAgentQueue>> {
+        const pool = await this.findAgentPool(agentPoolName, opts);
+
+        try {
+            return await this.createAgentQueue(project, agentPoolName, pool.id, opts);
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err) {
+                const status = (err as { status: number }).status;
+                if (status === 409 || status === 400) {
+                    const existing = await this.findAgentPoolQueue(project, pool.id, agentPoolName, opts);
+                    if (existing.exists) return existing.data!;
+                }
+            }
+            throw err;
+        }
     }
 
     /** Autoriza todos los pipelines para usar una queue. */

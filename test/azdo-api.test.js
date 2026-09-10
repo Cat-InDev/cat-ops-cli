@@ -587,6 +587,110 @@ test("createPullRequest() no duplica refs/heads", async () => {
 
 });
 
+test("createPullRequest() devuelve exists: true si el PR ya existe (sin POST)", async () => {
+
+    let postHit = false;
+
+    const existingPr = {
+        pullRequestId: 42, title: "Existing PR", description: "", status: "active",
+        createdBy: { name: "Dev", email: "d@t.com", date: "" }, creationDate: "",
+        sourceRefName: "refs/heads/feature/new", targetRefName: "refs/heads/main",
+        mergeStatus: "succeeded", mergeId: "", url: ""
+    };
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories/frontend/pullrequests": () => ({
+            count: 1, value: [existingPr]
+        }),
+        "POST /my-project/_apis/git/repositories/frontend/pullrequests": () => {
+            postHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createPullRequest("frontend", {
+            sourceRefName: "refs/heads/feature/new",
+            targetRefName: "refs/heads/main",
+            title: "New feature"
+        });
+
+        assert.equal(postHit, false, "no debe hacer POST si el PR ya existe");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.pullRequestId, 42);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createPullRequest() devuelve exists: true si el POST responde 409", async () => {
+
+    let postBody = null;
+    let getCalls = 0;
+
+    const existingPr = {
+        pullRequestId: 42, title: "Existing PR", description: "", status: "active",
+        createdBy: { name: "Dev", email: "d@t.com", date: "" }, creationDate: "",
+        sourceRefName: "refs/heads/feature/new", targetRefName: "refs/heads/main",
+        mergeStatus: "succeeded", mergeId: "", url: ""
+    };
+
+    const { server, url } = await createMockServer({
+        "POST /my-project/_apis/git/repositories/frontend/pullrequests": (_, body) => {
+            postBody = body;
+            return { statusCode: 409, body: { message: "An active pull request already exists" } };
+        },
+        "GET /my-project/_apis/git/repositories/frontend/pullrequests": () => {
+            getCalls++;
+            return getCalls === 1 ? { count: 0, value: [] } : { count: 1, value: [existingPr] };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createPullRequest("frontend", {
+            sourceRefName: "refs/heads/feature/new",
+            targetRefName: "refs/heads/main",
+            title: "New feature"
+        });
+
+        assert.ok(postBody, "debe intentar crear");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.pullRequestId, 42, "debe devolver el PR existente en vez de fallar");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createPullRequest() devuelve exists: false cuando crea un PR nuevo", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories/frontend/pullrequests": () => ({ count: 0, value: [] }),
+        "POST /my-project/_apis/git/repositories/frontend/pullrequests": (_, body) => ({
+            pullRequestId: 99, title: body.title, description: body.description || "",
+            status: "active", createdBy: { name: "Dev", email: "d@t.com", date: "" },
+            creationDate: "", sourceRefName: body.sourceRefName, targetRefName: body.targetRefName,
+            mergeStatus: "succeeded", mergeId: "", url: ""
+        })
+    });
+
+    const api = createApi(url);
+    const res = await api.createPullRequest("frontend", {
+        sourceRefName: "refs/heads/feature/new",
+        targetRefName: "refs/heads/main",
+        title: "New feature"
+    });
+
+    assert.equal(res.body.exists, false);
+    assert.equal(res.body.pullRequestId, 99);
+
+    await closeServer(server);
+
+});
+
 // ---------------------------------------------------------------------------
 // Build Definitions
 // ---------------------------------------------------------------------------
@@ -1167,20 +1271,21 @@ test("fileExists() devuelve el item si existe", async () => {
     const api = createApi(url);
     const result = await api.fileExists(undefined, "repo-1", "main", "/src/index.ts");
 
-    assert.equal(result.path, "/src/index.ts");
+    assert.equal(result.exists, true);
+    assert.equal(result.data.path, "/src/index.ts");
 
     await closeServer(server);
 
 });
 
-test("fileExists() devuelve undefined si no existe (404)", async () => {
+test("fileExists() devuelve exists: false si no existe (404)", async () => {
 
     const { server, url } = await createMockServer({});
 
     const api = createApi(url);
     const result = await api.fileExists(undefined, "repo-1", "main", "/missing.ts");
 
-    assert.equal(result, undefined);
+    assert.equal(result.exists, false);
 
     await closeServer(server);
 
@@ -1305,6 +1410,92 @@ test("createFileInRepo() crea archivo normal si no es template", async () => {
     assert.equal(receivedBody.commits[0].changes[0].newContent.content, "console.log(1)");
 
     await closeServer(server);
+
+});
+
+test("createFileInRepo() no pisa archivos existentes", async () => {
+
+    let pushHit = false;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories/repo-1/items": () => ({
+            objectId: "abc123", gitObjectType: "blob", path: "/README.md", content: "old"
+        }),
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "old" }]
+        }),
+        "POST /my-project/_apis/git/repositories/repo-1/pushes": () => {
+            pushHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const result = await api.createFileInRepo(undefined, "repo-1", "main", "README.md", "/", "$README:TEMPLATE");
+
+        assert.equal(result, undefined, "debe devolver undefined cuando el archivo ya existe");
+        assert.equal(pushHit, false, "no debe hacer push si el archivo ya existe");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createFileInRepo() crea archivo si no existe", async () => {
+
+    let receivedBody = null;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories/repo-1/items": () => ({ statusCode: 404, body: { message: "not found" } }),
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "zero", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
+        }),
+        "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
+            receivedBody = body;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const result = await api.createFileInRepo(undefined, "repo-1", "main", "app.js", "/src", "console.log(1)");
+
+        assert.ok(result, "debe devolver la respuesta de push");
+        assert.equal(receivedBody.commits[0].changes[0].item.path, "/src/app.js");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("overrideFileInRepo() sobreescribe archivos existentes", async () => {
+
+    let receivedBody = null;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories/repo-1/items": () => ({
+            objectId: "abc123", gitObjectType: "blob", path: "/README.md", content: "old"
+        }),
+        "GET /my-project/_apis/git/repositories/repo-1/commits": () => ({
+            value: [{ commitId: "old", comment: "", author: { name: "Dev", date: "" }, committer: { name: "Dev", date: "" } }]
+        }),
+        "POST /my-project/_apis/git/repositories/repo-1/pushes": (_, body) => {
+            receivedBody = body;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const result = await api.overrideFileInRepo(undefined, "repo-1", "main", "README.md", "/", "new content");
+
+        assert.ok(result, "debe devolver la respuesta de push");
+        assert.equal(receivedBody.commits[0].changes[0].item.path, "/README.md");
+        assert.equal(receivedBody.commits[0].changes[0].newContent.content, "new content");
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
@@ -1533,13 +1724,14 @@ test("webhookExists() devuelve el webhook si existe", async () => {
     const api = createApi(url);
     const result = await api.webhookExists("proj", "repo-1", "main", "https://webhook.example.com");
 
-    assert.equal(result.id, 1);
+    assert.equal(result.exists, true);
+    assert.equal(result.data.id, 1);
 
     await closeServer(server);
 
 });
 
-test("webhookExists() devuelve undefined si no existe", async () => {
+test("webhookExists() devuelve exists: false si no existe", async () => {
 
     const { server, url } = await createMockServer({
         "POST /_apis/hooks/subscriptionsQuery": () => ({ results: [] })
@@ -1548,7 +1740,7 @@ test("webhookExists() devuelve undefined si no existe", async () => {
     const api = createApi(url);
     const result = await api.webhookExists("proj", "repo-1", "main", "https://missing.com");
 
-    assert.equal(result, undefined);
+    assert.equal(result.exists, false);
 
     await closeServer(server);
 
@@ -1864,6 +2056,7 @@ test("addAgentPoolToProject() crea una queue con el pool existente", async () =>
             count: 1,
             value: [{ id: 7, name: "my-pool", url: "https://x", size: 0, isHosted: false }]
         }),
+        "GET /my-project/_apis/distributedtask/queues": () => ({ count: 0, value: [] }),
         "POST /my-project/_apis/distributedtask/queues": (_, body) => {
             receivedBody = body;
             return { id: 20, name: "my-pool", pool: { id: 7 } };
@@ -1876,6 +2069,101 @@ test("addAgentPoolToProject() crea una queue con el pool existente", async () =>
 
         assert.equal(receivedBody.pool.id, 7);
         assert.equal(result.body.pool.id, 7);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("addAgentPoolToProject() devuelve la queue existente sin crearla otra vez", async () => {
+
+    let postHit = false;
+    let queuesHit = false;
+
+    const { server, url } = await createMockServer({
+        "GET /_apis/distributedtask/pools": () => ({
+            count: 1,
+            value: [{ id: 7, name: "my-pool", url: "https://x", size: 0, isHosted: false }]
+        }),
+        "GET /my-project/_apis/distributedtask/queues": () => {
+            queuesHit = true;
+            return {
+                count: 1,
+                value: [{ id: 20, name: "my-pool", url: "https://x", size: 0, isHosted: false, pool: { id: 7, name: "my-pool", url: "https://x", size: 0, isHosted: false } }]
+            };
+        },
+        "POST /my-project/_apis/distributedtask/queues": () => {
+            postHit = true;
+            return { id: 999, name: "my-pool", pool: { id: 7 } };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const result = await api.addAgentPoolToProject(undefined, "my-pool");
+
+        assert.equal(queuesHit, true);
+        assert.equal(postHit, false, "no debe crear la queue si ya existe");
+        assert.equal(result.body.id, 20);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("overrideAgentPoolToProject() fuerza la creación de la queue", async () => {
+
+    let postHit = false;
+
+    const { server, url } = await createMockServer({
+        "GET /_apis/distributedtask/pools": () => ({
+            count: 1,
+            value: [{ id: 7, name: "my-pool", url: "https://x", size: 0, isHosted: false }]
+        }),
+        "GET /my-project/_apis/distributedtask/queues": () => ({ count: 0, value: [] }),
+        "POST /my-project/_apis/distributedtask/queues": (_, body) => {
+            postHit = true;
+            return { id: 30, name: "my-pool", pool: { id: 7 } };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const result = await api.overrideAgentPoolToProject(undefined, "my-pool");
+
+        assert.equal(postHit, true);
+        assert.equal(result.body.id, 30);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("overrideAgentPoolToProject() devuelve la queue existente si el POST responde 409", async () => {
+
+    let postBody = null;
+
+    const { server, url } = await createMockServer({
+        "GET /_apis/distributedtask/pools": () => ({
+            count: 1,
+            value: [{ id: 7, name: "my-pool", url: "https://x", size: 0, isHosted: false }]
+        }),
+        "POST /my-project/_apis/distributedtask/queues": (_, body) => {
+            postBody = body;
+            return { statusCode: 409, body: { message: "queue already exists" } };
+        },
+        "GET /my-project/_apis/distributedtask/queues": () => ({
+            count: 1,
+            value: [{ id: 20, name: "my-pool", url: "https://x", size: 0, isHosted: false, pool: { id: 7, name: "my-pool", url: "https://x", size: 0, isHosted: false } }]
+        })
+    });
+
+    try {
+        const api = createApi(url);
+        const result = await api.overrideAgentPoolToProject(undefined, "my-pool");
+
+        assert.ok(postBody, "debe intentar crear");
+        assert.equal(result.body.id, 20, "debe devolver la queue existente en vez de fallar");
     } finally {
         await closeServer(server);
     }
