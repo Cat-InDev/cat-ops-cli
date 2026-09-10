@@ -2154,9 +2154,10 @@ test("createEnvironmentApproval() devuelve exists: true si el POST responde 409"
     const { server, url } = await createMockServer({
         "GET /my-project/_apis/pipelines/checks/configurations": () => {
             getCalls++;
-            // pre-check (scoped + fallback) vacíos → POST → 409 → re-check encuentra
-            return getCalls <= 2 ? empty : { count: 1, value: [existing] };
+            // pre-check (scoped) vacío → POST → 409 → re-check encuentra
+            return getCalls === 1 ? empty : { count: 1, value: [existing] };
         },
+        "POST /my-project/_apis/pipelines/checks/queryconfigurations": () => empty,
         "POST /my-project/_apis/pipelines/checks/configurations": (_, body) => {
             postBody = body;
             return { statusCode: 409, body: { message: "A check configuration already exists" } };
@@ -2178,10 +2179,11 @@ test("createEnvironmentApproval() devuelve exists: true si el POST responde 409"
 
 });
 
-test("createEnvironmentApproval() encuentra la check existente vía fallback (sin resourceId) y no hace POST", async () => {
+test("createEnvironmentApproval() encuentra la check existente vía Query (POST) y no hace POST", async () => {
 
     let postHit = false;
     let scopedCalls = 0;
+    let queryBody = null;
 
     const { server, url } = await createMockServer({
         "GET /my-project/_apis/pipelines/checks/configurations": (url) => {
@@ -2189,10 +2191,15 @@ test("createEnvironmentApproval() encuentra la check existente vía fallback (si
                 scopedCalls++;
                 return { count: 0, value: [] };
             }
+            return { statusCode: 400, body: { message: "Value cannot be null. Parameter name: resourceId" } };
+        },
+        "POST /my-project/_apis/pipelines/checks/queryconfigurations": (reqUrl, body) => {
+            queryBody = body;
+            assert.equal(reqUrl.searchParams.get("resourceType"), null, "el query POST no debe usar params de query");
             return {
                 count: 1,
                 value: [
-                    { id: 900, type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", displayName: "Approval" }, resource: { type: "environment", id: 10, name: "staging" } }
+                    { id: 900, type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", displayName: "Approval" }, resource: { type: "environment", id: "10", name: "staging" } }
                 ]
             };
         },
@@ -2209,7 +2216,8 @@ test("createEnvironmentApproval() encuentra la check existente vía fallback (si
         });
 
         assert.equal(scopedCalls, 1, "la consulta filtrada por resourceId no encontró la check");
-        assert.equal(postHit, false, "el fallback encontró la check: no debe duplicar");
+        assert.deepEqual(queryBody, [{ type: "environment", id: "10" }], "el query POST debe recibir el recurso en el body");
+        assert.equal(postHit, false, "el query encontró la check: no debe duplicar");
         assert.equal(res.body.exists, true);
         assert.equal(res.body.id, 900);
     } finally {

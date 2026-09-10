@@ -1664,7 +1664,7 @@ private async findWebhook(
         environmentId: number,
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<AzdoPolicyConfiguration> | undefined> {
-        const isApprovalCheck = (c: AzdoPolicyConfiguration) =>
+const isApprovalCheck = (c: AzdoPolicyConfiguration) =>
             c.type?.id === "8C6F20A7-A545-4486-9777-F762FAFE0D4D" &&
             c.resource?.type === "environment" &&
             (c.resource?.id === environmentId || String(c.resource?.id) === String(environmentId));
@@ -1683,26 +1683,29 @@ private async findWebhook(
             const check = res.body.value.find(isApprovalCheck);
             if (check) return { ...res, body: check };
         } catch (err) {
-            // Si el filtro no está soportado (400/405...), intentamos listar todo.
+            // Si el filtro no está soportado (400/405...), intentamos query por recurso.
             if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
                 return undefined;
             }
         }
 
-        // Fallback: Azure no siempre filtra por resourceId/resourceType; listamos
-        // las checks del proyecto y matcheamos por tipo + recurso en código.
+// Fallback: el List de Azure exige resourceType + resourceId a la vez, así que
+        // no hay "list all" fiable. Usamos el endpoint Query (POST), que recibe
+        // los recursos en el body y devuelve sus checks exactas — sin params de
+        // query expuestos a quedar nulos.
         try {
             const res = await this.request<AzdoListResponse<AzdoPolicyConfiguration>>(
-                "GET",
-                "/pipelines/checks/configurations",
+                "POST",
+                "/pipelines/checks/queryconfigurations",
                 {
                     ...opts,
                     project: project ?? opts?.project,
                     apiVersion: "7.1-preview.1",
-                    query: { typeId: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", ...opts?.query }
+                    body: [{ type: "environment", id: String(environmentId) }]
                 }
             );
-            const check = res.body.value.find(isApprovalCheck);
+            const value = Array.isArray(res.body) ? (res.body as AzdoPolicyConfiguration[]) : res.body.value;
+            const check = value.find(isApprovalCheck);
             if (check) return { ...res, body: check };
         } catch (err) {
             if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
@@ -1739,7 +1742,7 @@ private async findWebhook(
                     ...opts,
                     project: project ?? opts?.project,
                     apiVersion: "7.1-preview.1",
-                    query: { ...opts?.query },
+                    query: { resourceType: "environment", resourceId: String(environmentId), ...opts?.query },
                     body: {
                         type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", name: "Approval" },
                         settings: {

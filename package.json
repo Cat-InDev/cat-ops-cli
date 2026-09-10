@@ -1,6 +1,6 @@
 {
   "name": "@cat-indev/catops-cli",
-  "version": "0.0.1-alpha.34",
+  "version": "0.0.1-alpha.38",
   "description": "Framework CLI para pipelines DevOps (shell, docker, git, kubectl, helm, npm, terraform, ansible, argocd, tekton, oc, az) sobre un ExecutionContext compartido, con menus interactivos y selectores automaticos por flag. Escrito en TypeScript, 100% usable desde JavaScript.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -38,7 +38,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf dist",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "prebuild": "npm run clean",
     "example": "npm run build && node examples/pipeline-example.js",
     "start": "node dist/bin/devops-cli.js",
