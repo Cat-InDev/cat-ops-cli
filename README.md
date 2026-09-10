@@ -701,6 +701,8 @@ const created = await azdo.createEnvironment("mi-proyecto", "staging", "Staging 
 // created.body.exists === true en lugar de lanzar el 409 de Azure
 ```
 
+> **Creación idempotente**: todos los métodos `create*` validan existencia antes de crear y devuelven el recurso existente con `exists: true` en lugar de lanzar el error 409 de Azure (y si Azure responde 409 por un race, recuperan el existente). Esto aplica a `createPullRequest()`, `createEnvironment()`, `createEnvironmentWithApprovals()`, `createEnvironmentApproval()`, `createWebhook()`, `createPipeline()`, `createVariableGroup()`, `createBuildFolder()`, `createFileInRepo()`, `addAgentPoolToProject()` y `overrideAgentPoolToProject()`.
+
 ### Overrides por llamada
 
 Cada método acepta un objeto de opciones con `project`, `apiVersion`, `query`, `insecureTls` y `exec`:
@@ -757,7 +759,7 @@ Qué aporta cada pieza:
 
 Notas:
 
-- El error conserva `status`, `headers`, `body` y `request` del error HTTP original, así que los checks tipo `err.status === 404` siguen funcionando igual que siempre. Los helpers de existencia (`branchExists()`, `repoExists()`, `fileExists()`, `webhookExists()`, `environmentExists()`) devuelven una propiedad `exists` en lugar de lanzar: `branchExists()` la expone en `body.exists`, y el resto en `result.exists` (con `result.data` cuando existe).
+- El error conserva `status`, `headers`, `body` y `request` del error HTTP original, así que los checks tipo `err.status === 404` siguen funcionando igual que siempre. Los helpers de existencia (`branchExists()`, `repoExists()`, `fileExists()`, `webhookExists()`, `environmentExists()`, `pipelineExists()`) devuelven una propiedad `exists` en lugar de lanzar: `branchExists()` la expone en `body.exists`, y el resto en `result.exists` (con `result.data` cuando existe).
 - Detecta códigos TF/VS conocidos (`TF400813`, `TF401019`, `TF401027`, `TF401320`, `VS800075`, ...) con explicación y sugerencia específica; los desconocidos caen a sugerencias por status HTTP (401 → PAT expirado/org incorrecta, 404 → puede ser falta de permisos, 409 → `oldObjectId` desactualizado, 429 → throttling, etc.).
 - Aplana la cadena `innerException` del servidor en `detail.innerMessages`.
 - Soporta cuerpos no-JSON (proxies que devuelven HTML) y clasifica errores de red/timeout (`status: 0`) como `Red / Timeout`.

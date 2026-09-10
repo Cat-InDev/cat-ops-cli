@@ -1768,8 +1768,69 @@ test("createWebhook() envía POST con body correcto", async () => {
     assert.equal(receivedBody.publisherInputs.repository, "repo-1");
     assert.equal(receivedBody.consumerInputs.url, "https://hook.com");
     assert.equal(res.body.id, 42);
+    assert.equal(res.body.exists, false);
 
     await closeServer(server);
+
+});
+
+test("createWebhook() devuelve exists: true si el webhook ya existe (sin POST)", async () => {
+
+    let postHit = false;
+
+    const { server, url } = await createMockServer({
+        "POST /_apis/hooks/subscriptionsQuery": () => ({
+            results: [
+                { id: 42, publisherInputs: { projectId: "proj", repository: "repo-1", branch: "main" }, consumerInputs: { url: "https://hook.com" } }
+            ]
+        }),
+        "POST /_apis/hooks/subscriptions": () => {
+            postHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createWebhook("proj", "repo-1", "main", "https://hook.com");
+
+        assert.equal(postHit, false, "no debe hacer POST si el webhook ya existe");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 42);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createWebhook() devuelve exists: true si el POST responde 409", async () => {
+
+    let postBody = null;
+    let queryCalls = 0;
+
+    const existing = { id: 42, publisherInputs: { projectId: "proj", repository: "repo-1", branch: "main" }, consumerInputs: { url: "https://hook.com" } };
+
+    const { server, url } = await createMockServer({
+        "POST /_apis/hooks/subscriptionsQuery": () => {
+            queryCalls++;
+            return queryCalls === 1 ? { results: [] } : { results: [existing] };
+        },
+        "POST /_apis/hooks/subscriptions": (_, body) => {
+            postBody = body;
+            return { statusCode: 409, body: { message: "webhook already exists" } };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createWebhook("proj", "repo-1", "main", "https://hook.com");
+
+        assert.ok(postBody, "debe intentar crear");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 42, "debe devolver el webhook existente en vez de fallar");
+    } finally {
+        await closeServer(server);
+    }
 
 });
 
@@ -2019,6 +2080,145 @@ test("createEnvironmentWithApprovals() devuelve exists: true si el environment y
 });
 
 // ===========================================================================
+// createEnvironmentApproval()
+// ===========================================================================
+
+test("createEnvironmentApproval() envía POST y devuelve exists: false", async () => {
+
+    let receivedBody = null;
+    let receivedQuery = null;
+
+    const { server, url } = await createMockServer({
+        "POST /my-project/_apis/pipelines/checks/configurations": (reqUrl, body) => {
+            receivedBody = body;
+            receivedQuery = reqUrl.searchParams;
+            return { id: 500, type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", displayName: "Approval" } };
+        }
+    });
+
+    const api = createApi(url);
+    const res = await api.createEnvironmentApproval(undefined, 10, "staging", {
+        displayName: "Contributors", samAccountName: "Contributors", localId: "id-1", subjectDescriptor: "desc-1"
+    });
+
+    assert.equal(receivedBody.type.id, "8C6F20A7-A545-4486-9777-F762FAFE0D4D");
+    assert.equal(receivedBody.resource.type, "environment");
+    assert.equal(receivedBody.resource.id, 10);
+    assert.equal(receivedQuery.get("resourceType"), "environment", "el POST debe enviar resourceType");
+    assert.equal(receivedQuery.get("resourceId"), "10", "el POST debe enviar resourceId");
+    assert.equal(res.body.id, 500);
+    assert.equal(res.body.exists, false);
+
+    await closeServer(server);
+
+});
+
+test("createEnvironmentApproval() devuelve exists: true si la approval ya existe (sin POST)", async () => {
+
+    let postHit = false;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/pipelines/checks/configurations": () => ({
+            count: 1,
+            value: [{ id: 500, type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", displayName: "Approval" }, resource: { type: "environment", id: 10, name: "staging" } }]
+        }),
+        "POST /my-project/_apis/pipelines/checks/configurations": () => {
+            postHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createEnvironmentApproval(undefined, 10, "staging", {
+            displayName: "Contributors", samAccountName: "Contributors", localId: "id-1", subjectDescriptor: "desc-1"
+        });
+
+        assert.equal(postHit, false, "no debe duplicar la approval si ya existe");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 500);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createEnvironmentApproval() devuelve exists: true si el POST responde 409", async () => {
+
+    let postBody = null;
+    let getCalls = 0;
+
+    const empty = { count: 0, value: [] };
+    const existing = { id: 500, type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", displayName: "Approval" }, resource: { type: "environment", id: 10, name: "staging" } };
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/pipelines/checks/configurations": () => {
+            getCalls++;
+            // pre-check (scoped + fallback) vacíos → POST → 409 → re-check encuentra
+            return getCalls <= 2 ? empty : { count: 1, value: [existing] };
+        },
+        "POST /my-project/_apis/pipelines/checks/configurations": (_, body) => {
+            postBody = body;
+            return { statusCode: 409, body: { message: "A check configuration already exists" } };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createEnvironmentApproval(undefined, 10, "staging", {
+            displayName: "Contributors", samAccountName: "Contributors", localId: "id-1", subjectDescriptor: "desc-1"
+        });
+
+        assert.ok(postBody, "debe intentar crear");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 500, "debe devolver la approval existente en vez de fallar");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createEnvironmentApproval() encuentra la check existente vía fallback (sin resourceId) y no hace POST", async () => {
+
+    let postHit = false;
+    let scopedCalls = 0;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/pipelines/checks/configurations": (url) => {
+            if (url.searchParams.has("resourceId")) {
+                scopedCalls++;
+                return { count: 0, value: [] };
+            }
+            return {
+                count: 1,
+                value: [
+                    { id: 900, type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", displayName: "Approval" }, resource: { type: "environment", id: 10, name: "staging" } }
+                ]
+            };
+        },
+        "POST /my-project/_apis/pipelines/checks/configurations": () => {
+            postHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createEnvironmentApproval(undefined, 10, "staging", {
+            displayName: "Contributors", samAccountName: "Contributors", localId: "id-1", subjectDescriptor: "desc-1"
+        });
+
+        assert.equal(scopedCalls, 1, "la consulta filtrada por resourceId no encontró la check");
+        assert.equal(postHit, false, "el fallback encontró la check: no debe duplicar");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 900);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+// ===========================================================================
 // findIdentityGroup()
 // ===========================================================================
 
@@ -2128,6 +2328,7 @@ test("createVariableGroup() crea un variable group nuevo", async () => {
 
     assert.equal(receivedBody.name, "my-vars");
     assert.equal(result.name, "my-vars");
+    assert.equal(result.exists, false);
 
     await closeServer(server);
 
@@ -2153,6 +2354,7 @@ test("createVariableGroup() no crea si ya existe con el mismo nombre", async () 
 
     assert.equal(postCalled, false);
     assert.equal(result.id, 5);
+    assert.equal(result.exists, true);
 
     await closeServer(server);
 
@@ -2179,6 +2381,7 @@ test("createBuildFolder() crea una carpeta nueva", async () => {
     const result = await api.createBuildFolder(undefined, "MyFolder");
 
     assert.equal(result.path, "\\MyFolder");
+    assert.equal(result.exists, false);
 
     await closeServer(server);
 
@@ -2197,6 +2400,7 @@ test("createBuildFolder() no crea si ya existe", async () => {
     const result = await api.createBuildFolder(undefined, "Existing");
 
     assert.equal(result.path, "\\Existing");
+    assert.equal(result.exists, true);
 
     await closeServer(server);
 
@@ -2233,6 +2437,122 @@ test("createPipeline() crea un pipeline YAML", async () => {
     assert.equal(receivedBody.configuration.path, "/azure-pipelines.yml");
     assert.equal(receivedBody.configuration.repository.id, "repo-1");
     assert.equal(res.body.id, 100);
+    assert.equal(res.body.exists, false);
+
+    await closeServer(server);
+
+});
+
+test("createPipeline() devuelve exists: true si el pipeline ya existe (sin POST)", async () => {
+
+    let postHit = false;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories": () => ({
+            count: 1,
+            value: [{ id: "repo-1", name: "frontend", url: "https://x", defaultBranch: "refs/heads/main" }]
+        }),
+        "GET /my-project/_apis/pipelines": () => ({
+            count: 1,
+            value: [{ id: 100, name: "CI Pipeline", folder: "\\", revision: 1, url: "" }]
+        }),
+        "POST /my-project/_apis/pipelines": () => {
+            postHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createPipeline({
+            project: undefined,
+            name: "CI Pipeline",
+            repository: "frontend",
+            yamlPath: "/azure-pipelines.yml"
+        });
+
+        assert.equal(postHit, false, "no debe hacer POST si el pipeline ya existe");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 100);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createPipeline() devuelve exists: true si el POST responde 409", async () => {
+
+    let postBody = null;
+    let getCalls = 0;
+
+    const existing = { id: 100, name: "CI Pipeline", folder: "\\", revision: 1, url: "" };
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories": () => ({
+            count: 1,
+            value: [{ id: "repo-1", name: "frontend", url: "https://x", defaultBranch: "refs/heads/main" }]
+        }),
+        "GET /my-project/_apis/pipelines": () => {
+            getCalls++;
+            return getCalls === 1 ? { count: 0, value: [] } : { count: 1, value: [existing] };
+        },
+        "POST /my-project/_apis/pipelines": (_, body) => {
+            postBody = body;
+            return { statusCode: 409, body: { message: "pipeline already exists" } };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createPipeline({
+            project: undefined,
+            name: "CI Pipeline",
+            repository: "frontend",
+            yamlPath: "/azure-pipelines.yml"
+        });
+
+        assert.ok(postBody, "debe intentar crear");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 100, "debe devolver el pipeline existente en vez de fallar");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+// ===========================================================================
+// pipelineExists()
+// ===========================================================================
+
+test("pipelineExists() devuelve exists: true si existe", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/pipelines": () => ({
+            count: 1,
+            value: [{ id: 100, name: "CI Pipeline", folder: "\\", revision: 1, url: "" }]
+        })
+    });
+
+    const api = createApi(url);
+    const result = await api.pipelineExists(undefined, "CI Pipeline");
+
+    assert.equal(result.exists, true);
+    assert.equal(result.data.id, 100);
+
+    await closeServer(server);
+
+});
+
+test("pipelineExists() devuelve exists: false si no existe", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/pipelines": () => ({ count: 0, value: [] })
+    });
+
+    const api = createApi(url);
+    const result = await api.pipelineExists(undefined, "missing");
+
+    assert.equal(result.exists, false);
 
     await closeServer(server);
 
@@ -2288,6 +2608,7 @@ test("addAgentPoolToProject() crea una queue con el pool existente", async () =>
 
         assert.equal(receivedBody.pool.id, 7);
         assert.equal(result.body.pool.id, 7);
+        assert.equal(result.body.exists, false);
     } finally {
         await closeServer(server);
     }
@@ -2324,6 +2645,7 @@ test("addAgentPoolToProject() devuelve la queue existente sin crearla otra vez",
         assert.equal(queuesHit, true);
         assert.equal(postHit, false, "no debe crear la queue si ya existe");
         assert.equal(result.body.id, 20);
+        assert.equal(result.body.exists, true);
     } finally {
         await closeServer(server);
     }
@@ -2352,6 +2674,7 @@ test("overrideAgentPoolToProject() fuerza la creación de la queue", async () =>
 
         assert.equal(postHit, true);
         assert.equal(result.body.id, 30);
+        assert.equal(result.body.exists, false);
     } finally {
         await closeServer(server);
     }
@@ -2383,6 +2706,7 @@ test("overrideAgentPoolToProject() devuelve la queue existente si el POST respon
 
         assert.ok(postBody, "debe intentar crear");
         assert.equal(result.body.id, 20, "debe devolver la queue existente en vez de fallar");
+        assert.equal(result.body.exists, true);
     } finally {
         await closeServer(server);
     }

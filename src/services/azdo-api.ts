@@ -1,4 +1,4 @@
-import type { HttpRequest, HttpResponse, RequestInterceptor, ResponseInterceptor } from "./http-types";
+import type { HttpRequest, HttpResponse, HttpError, RequestInterceptor, ResponseInterceptor } from "./http-types";
 import type { ExecOptions } from "../core/types";
 import { HttpService } from "./http";
 import { toAzdoApiError } from "./azdo-errors";
@@ -225,6 +225,8 @@ export interface AzdoPolicyConfiguration {
     isEnabled: boolean;
     isBlocking: boolean;
     settings: Record<string, unknown>;
+    /** Recurso protegido por la check (por ejemplo el environment de una approval). */
+    resource?: { type?: string; id?: number | string; name?: string };
 }
 
 export interface AzdoAgentPool {
@@ -499,6 +501,39 @@ export class AzureDevOpsApi {
         return clean ? `refs/heads/${clean}` : branch;
     }
 
+    /**
+     * Patrón compartido por las funciones de creación: si el recurso ya existe,
+     * o Azure responde 409/400 por duplicado en un race, devuelve el existente
+     * con `exists: true` en el body en lugar de lanzar error.
+     */
+    private async createWithExistenceCheck<T>(
+        findExisting: () => Promise<HttpResponse<T> | undefined>,
+        create: () => Promise<HttpResponse<T>>,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<T & { exists: boolean }>> {
+        const existing = await findExisting();
+        if (existing) {
+            return { ...existing, body: { ...existing.body, exists: true } };
+        }
+
+        try {
+            const res = await create();
+            return { ...res, body: { ...res.body, exists: false } };
+        } catch (err) {
+            // Race: entre el pre-check y la creación alguien creó el recurso.
+            if (err && typeof err === "object" && "status" in err) {
+                const status = (err as { status: number }).status;
+                if (status === 409 || status === 400) {
+                    const found = await findExisting();
+                    if (found) {
+                        return { ...found, body: { ...found.body, exists: true } };
+                    }
+                }
+            }
+            throw err;
+        }
+    }
+
     // ---- internal request helper ----
 
     async request<T = unknown>(
@@ -693,32 +728,14 @@ export class AzureDevOpsApi {
         const sourceRefName = this.toRefName(pr.sourceRefName);
         const targetRefName = this.toRefName(pr.targetRefName);
 
-        const existing = await this.findPullRequest(repoNameOrId, sourceRefName, targetRefName, opts);
-        if (existing) {
-            return { ...existing, body: { ...existing.body, exists: true } };
-        }
-
-        try {
-            const res = await this.request<AzdoGitPullRequest>(
+        return this.createWithExistenceCheck(
+            () => this.findPullRequest(repoNameOrId, sourceRefName, targetRefName, opts),
+            () => this.request<AzdoGitPullRequest>(
                 "POST",
                 `/git/repositories/${encodeURIComponent(repoNameOrId)}/pullrequests`,
                 { ...opts, body: { ...pr, sourceRefName, targetRefName } }
-            );
-            return { ...res, body: { ...res.body, exists: false } };
-        } catch (err) {
-            // Race: entre el pre-check y el POST alguien creó el PR. Azure
-            // responde 409/400; lo traducimos al PR existente en vez de fallar.
-            if (err && typeof err === "object" && "status" in err) {
-                const status = (err as { status: number }).status;
-                if (status === 409 || status === 400) {
-                    const found = await this.findPullRequest(repoNameOrId, sourceRefName, targetRefName, opts);
-                    if (found) {
-                        return { ...found, body: { ...found.body, exists: true } };
-                    }
-                }
-            }
-            throw err;
-        }
+            )
+        );
     }
 
     // =========================================================================
@@ -1447,17 +1464,13 @@ export class AzureDevOpsApi {
     // =========================================================================
     // Webhooks
     // =========================================================================
-/**
-     * Verifica si existe un webhook de push para un repo/branch/URL dados.
-     * Devuelve `{ exists: true, data }` si existe, `{ exists: false }` si no.
-     */
-    async webhookExists(
+private async findWebhook(
         projectId: string,
         repositoryId: string,
         branchName: string,
         webhookUrl: string,
         opts?: AzdoRequestOptions
-    ): Promise<{ exists: boolean; data?: AzdoWebHookSubscription }> {
+    ): Promise<HttpResponse<AzdoWebHookSubscription> | undefined> {
         try {
             const res = await this.request<{ results: AzdoWebHookSubscription[] }>(
                 "POST",
@@ -1485,40 +1498,66 @@ export class AzureDevOpsApi {
                     && e.publisherInputs.branch === branchName
                     && e.consumerInputs.url === webhookUrl
             );
-            return found ? { exists: true, data: found } : { exists: false };
+            return found ? { ...res, body: found } : undefined;
         } catch {
-            return { exists: false };
+            return undefined;
         }
     }
 
-    /** Crea un webhook de push para un repositorio. */
-    createWebhook(
+    /**
+     * Verifica si existe un webhook de push para un repo/branch/URL dados.
+     * Devuelve `{ exists: true, data }` si existe, `{ exists: false }` si no.
+     */
+    async webhookExists(
+        projectId: string,
+        repositoryId: string,
+        branchName: string,
+        webhookUrl: string,
+        opts?: AzdoRequestOptions
+    ): Promise<{ exists: boolean; data?: AzdoWebHookSubscription }> {
+        const found = await this.findWebhook(projectId, repositoryId, branchName, webhookUrl, opts);
+        return found ? { exists: true, data: found.body } : { exists: false };
+    }
+
+    /**
+     * Crea un webhook de push para un repositorio. Si ya existe un webhook con
+     * el mismo repo/branch/URL, no lanza el 409 de Azure: devuelve el existente
+     * con `exists: true` en el body.
+     */
+    async createWebhook(
         projectId: string,
         repoId: string,
         sourceBranch: string,
         webhookUrl: string,
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<AzdoWebHookSubscription>> {
-        return this.request("POST", "/hooks/subscriptions", {
-            ...opts,
-            organizationLevel: true,
-            apiVersion: "7.2-preview.1",
-            body: {
-                consumerActionId: "httpRequest",
-                consumerId: "webHooks",
-                consumerInputs: { url: webhookUrl },
-                eventType: "git.push",
-                publisherId: "tfs",
-                publisherInputs: {
-                    repository: repoId,
-                    branch: sourceBranch,
-                    pushedBy: "",
-                    projectId
-                },
-                resourceVersion: "1.0",
-                scope: 1
-            }
-        });
+    ): Promise<HttpResponse<AzdoWebHookSubscription & { exists: boolean }>> {
+        return this.createWithExistenceCheck(
+            () => this.findWebhook(projectId, repoId, sourceBranch, webhookUrl, opts),
+            () => this.request<AzdoWebHookSubscription>(
+                "POST",
+                "/hooks/subscriptions",
+                {
+                    ...opts,
+                    organizationLevel: true,
+                    apiVersion: "7.2-preview.1",
+                    body: {
+                        consumerActionId: "httpRequest",
+                        consumerId: "webHooks",
+                        consumerInputs: { url: webhookUrl },
+                        eventType: "git.push",
+                        publisherId: "tfs",
+                        publisherInputs: {
+                            repository: repoId,
+                            branch: sourceBranch,
+                            pushedBy: "",
+                            projectId
+                        },
+                        resourceVersion: "1.0",
+                        scope: 1
+                    }
+                }
+            )
+        );
     }
 
     // =========================================================================
@@ -1576,13 +1615,9 @@ export class AzureDevOpsApi {
         description = "",
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<AzdoEnvironment & { exists: boolean }>> {
-        const existing = await this.findEnvironment(project, name, opts);
-        if (existing) {
-            return { ...existing, body: { ...existing.body, exists: true } };
-        }
-
-        try {
-            const res = await this.request<AzdoEnvironment>(
+        return this.createWithExistenceCheck(
+            () => this.findEnvironment(project, name, opts),
+            () => this.request<AzdoEnvironment>(
                 "POST",
                 "/distributedtask/environments",
                 {
@@ -1591,21 +1626,8 @@ export class AzureDevOpsApi {
                     apiVersion: "5.2-preview.1",
                     body: { name, description }
                 }
-            );
-            return { ...res, body: { ...res.body, exists: false } };
-        } catch (err) {
-            // Race: entre el pre-check y el POST alguien creó el environment.
-            if (err && typeof err === "object" && "status" in err) {
-                const status = (err as { status: number }).status;
-                if (status === 409 || status === 400) {
-                    const found = await this.findEnvironment(project, name, opts);
-                    if (found) {
-                        return { ...found, body: { ...found.body, exists: true } };
-                    }
-                }
-            }
-            throw err;
-        }
+            )
+        );
     }
 
     /** Busca un grupo de identidades por nombre (SAM account name). */
@@ -1636,43 +1658,151 @@ export class AzureDevOpsApi {
         return group;
     }
 
-    /** Crea una approval check para un environment. */
-    createEnvironmentApproval(
+    /** Busca la approval check de un environment, si existe. */
+    private async findEnvironmentCheck(
+        project: string | undefined,
+        environmentId: number,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoPolicyConfiguration> | undefined> {
+        const isApprovalCheck = (c: AzdoPolicyConfiguration) =>
+            c.type?.id === "8C6F20A7-A545-4486-9777-F762FAFE0D4D" &&
+            c.resource?.type === "environment" &&
+            (c.resource?.id === environmentId || String(c.resource?.id) === String(environmentId));
+
+        try {
+            const res = await this.request<AzdoListResponse<AzdoPolicyConfiguration>>(
+                "GET",
+                "/pipelines/checks/configurations",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    apiVersion: "7.1-preview.1",
+                    query: { resourceType: "environment", resourceId: String(environmentId), ...opts?.query }
+                }
+            );
+            const check = res.body.value.find(isApprovalCheck);
+            if (check) return { ...res, body: check };
+        } catch (err) {
+            // Si el filtro no está soportado (400/405...), intentamos listar todo.
+            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                return undefined;
+            }
+        }
+
+        // Fallback: Azure no siempre filtra por resourceId/resourceType; listamos
+        // las checks del proyecto y matcheamos por tipo + recurso en código.
+        try {
+            const res = await this.request<AzdoListResponse<AzdoPolicyConfiguration>>(
+                "GET",
+                "/pipelines/checks/configurations",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    apiVersion: "7.1-preview.1",
+                    query: { typeId: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", ...opts?.query }
+                }
+            );
+            const check = res.body.value.find(isApprovalCheck);
+            if (check) return { ...res, body: check };
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                return undefined;
+            }
+            throw err;
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Crea una approval check para un environment. Si el environment ya tiene
+     * una approval check, no la duplica: devuelve la existente con
+     * `exists: true` en el body.
+     */
+    async createEnvironmentApproval(
         project: string | undefined,
         environmentId: number,
         environmentName: string,
         approver: AzdoIdentityGroup,
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<unknown>> {
-        return this.request("POST", "/pipelines/checks/configurations", {
-            ...opts,
-            project: project ?? opts?.project,
-            apiVersion: "5.2-preview.1",
-            body: {
-                type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", name: "Approval" },
-                settings: {
-                    approvers: [
-                        {
-                            displayName: approver.displayName,
-                            id: approver.localId,
-                            descriptor: approver.subjectDescriptor,
-                            imageUrl: approver.imageUrl ?? "",
-                            uniqueName: approver.uniqueName ?? ""
-                        }
-                    ],
-                    executionOrder: 1,
-                    instructions: "",
-                    blockedApprovers: [],
-                    minRequiredApprovers: 0,
-                    requesterCannotBeApprover: false,
-                    definitionRef: {
-                        id: "26014962-64a0-49f4-885b-4b874119a5cc"
+    ): Promise<HttpResponse<AzdoPolicyConfiguration & { exists: boolean }>> {
+        const existing = await this.findEnvironmentCheck(project, environmentId, opts);
+        if (existing) {
+            return { ...existing, body: { ...existing.body, exists: true } };
+        }
+
+        const post = () =>
+            this.request<AzdoPolicyConfiguration>(
+                "POST",
+                "/pipelines/checks/configurations",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    apiVersion: "7.1-preview.1",
+                    query: { ...opts?.query },
+                    body: {
+                        type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", name: "Approval" },
+                        settings: {
+                            approvers: [
+                                {
+                                    displayName: approver.displayName,
+                                    id: approver.localId,
+                                    descriptor: approver.subjectDescriptor,
+                                    imageUrl: approver.imageUrl ?? "",
+                                    uniqueName: approver.uniqueName ?? ""
+                                }
+                            ],
+                            executionOrder: 1,
+                            instructions: "",
+                            blockedApprovers: [],
+                            minRequiredApprovers: 0,
+                            requesterCannotBeApprover: false,
+                            definitionRef: {
+                                id: "26014962-64a0-49f4-885b-4b874119a5cc"
+                            }
+                        },
+                        resource: { type: "environment", id: environmentId, name: environmentName },
+                        timeout: 43200
                     }
-                },
-                resource: { type: "environment", id: environmentId, name: environmentName },
-                timeout: 43200
+                }
+            );
+
+        try {
+            const created = await post();
+            return { ...created, body: { ...created.body, exists: false } };
+        } catch (err) {
+            const httpErr = err && typeof err === "object" && "status" in err ? (err as HttpError) : undefined;
+            const status = httpErr?.status;
+            const message =
+                err instanceof Error
+                    ? err.message
+                    : String((httpErr?.body as { message?: string } | null)?.message ?? "");
+            const isDuplicate =
+                status === 409 ||
+                (status === 400 && /(?:already\s+exists|exists\s+already|duplicate)/i.test(String(message)));
+
+            if (httpErr && isDuplicate) {
+                const found = await this.findEnvironmentCheck(project, environmentId, opts);
+                if (found) {
+                    return { ...found, body: { ...found.body, exists: true } };
+                }
+                // Azure confirmó que la check ya existe, pero no la lista:
+                // devolvemos la existente sin fallar (idempotente).
+                return {
+                    ...httpErr,
+                    body: {
+                        id: 0,
+                        url: "",
+                        type: { id: "8C6F20A7-A545-4486-9777-F762FAFE0D4D", displayName: "Approval" },
+                        isEnabled: true,
+                        isBlocking: true,
+                        settings: {},
+                        exists: true
+                    }
+                };
             }
-        });
+            throw err;
+        }
     }
 
     /**
@@ -1979,46 +2109,62 @@ export class AzureDevOpsApi {
 
     /**
      * Asocia un agent pool existente a un proyecto (crea una queue).
-     * Si la queue ya existe, la devuelve tal cual: no crea otra, no la
-     * reemplaza y no produce error 40X.
+     * Si la queue ya existe, la devuelve con `exists: true` en el body: no crea
+     * otra, no la reemplaza y no produce error 40X.
      */
     async addAgentPoolToProject(
         project: string | undefined,
         agentPoolName: string,
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<AzdoAgentQueue>> {
+    ): Promise<HttpResponse<AzdoAgentQueue & { exists: boolean }>> {
         const pool = await this.findAgentPool(agentPoolName, opts);
 
         const existing = await this.findAgentPoolQueue(project, pool.id, agentPoolName, opts);
-        if (existing.exists) return existing.data!;
+        if (existing.exists && existing.data) {
+            return { ...existing.data, body: { ...existing.data.body, exists: true } };
+        }
 
-        return this.createAgentQueue(project, agentPoolName, pool.id, opts);
+        return this.createAgentQueueWithExists(project, agentPoolName, pool.id, opts, false);
+    }
+
+    /** Crea la queue y agrega `exists: false` al body (o recupera en un 409). */
+    private async createAgentQueueWithExists(
+        project: string | undefined,
+        agentPoolName: string,
+        poolId: number,
+        opts?: AzdoRequestOptions,
+        force = true
+    ): Promise<HttpResponse<AzdoAgentQueue & { exists: boolean }>> {
+        try {
+            const res = await this.createAgentQueue(project, agentPoolName, poolId, opts);
+            return { ...res, body: { ...res.body, exists: false } };
+        } catch (err) {
+            if (force && err && typeof err === "object" && "status" in err) {
+                const status = (err as { status: number }).status;
+                if (status === 409 || status === 400) {
+                    const existing = await this.findAgentPoolQueue(project, poolId, agentPoolName, opts);
+                    if (existing.exists && existing.data) {
+                        return { ...existing.data, body: { ...existing.data.body, exists: true } };
+                    }
+                }
+            }
+            throw err;
+        }
     }
 
     /**
      * Fuerza la creación de la queue del pool en el proyecto (sin pre-chequeo).
      * Si Azure responde 409/400 porque la queue ya existe, devuelve la queue
-     * existente en lugar de fallar.
+     * existente con `exists: true` en el body.
      */
     async overrideAgentPoolToProject(
         project: string | undefined,
         agentPoolName: string,
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<AzdoAgentQueue>> {
+    ): Promise<HttpResponse<AzdoAgentQueue & { exists: boolean }>> {
         const pool = await this.findAgentPool(agentPoolName, opts);
 
-        try {
-            return await this.createAgentQueue(project, agentPoolName, pool.id, opts);
-        } catch (err) {
-            if (err && typeof err === "object" && "status" in err) {
-                const status = (err as { status: number }).status;
-                if (status === 409 || status === 400) {
-                    const existing = await this.findAgentPoolQueue(project, pool.id, agentPoolName, opts);
-                    if (existing.exists) return existing.data!;
-                }
-            }
-            throw err;
-        }
+        return this.createAgentQueueWithExists(project, agentPoolName, pool.id, opts, true);
     }
 
     /** Autoriza todos los pipelines para usar una queue. */
@@ -2043,20 +2189,23 @@ export class AzureDevOpsApi {
     // Variable Groups
     // =========================================================================
 
-    /** Crea un variable group. Si ya existe con el mismo nombre, lo devuelve sin crear. */
+    /**
+     * Crea un variable group. Si ya existe con el mismo nombre, lo devuelve
+     * con `exists: true` sin crear.
+     */
     async createVariableGroup(
         project: string | undefined,
         name: string,
         variables: Record<string, { value?: string; isSecret?: boolean }> = {},
         opts?: AzdoRequestOptions
-    ): Promise<AzdoVariableGroup> {
+    ): Promise<AzdoVariableGroup & { exists: boolean }> {
         const existingRes = await this.request<AzdoListResponse<AzdoVariableGroup>>(
             "GET",
             "/distributedtask/variablegroups",
             { ...opts, project: project ?? opts?.project, apiVersion: "7.1-preview.1" }
         );
         const existing = existingRes.body.value.find(vg => vg.name === name);
-        if (existing) return existing;
+        if (existing) return { ...existing, exists: true };
 
         const res = await this.request<AzdoVariableGroup>(
             "POST",
@@ -2068,19 +2217,19 @@ export class AzureDevOpsApi {
                 body: { name, variables }
             }
         );
-        return res.body;
+        return { ...res.body, exists: false };
     }
 
     // =========================================================================
     // Build Folders
     // =========================================================================
 
-    /** Crea una carpeta de build. Si ya existe, la devuelve. */
+    /** Crea una carpeta de build. Si ya existe, la devuelve con `exists: true`. */
     async createBuildFolder(
         project: string | undefined,
         folderPath: string,
         opts?: AzdoRequestOptions
-    ): Promise<AzdoBuildFolder> {
+    ): Promise<AzdoBuildFolder & { exists: boolean }> {
         const normalizedPath = folderPath.startsWith("\\") ? folderPath : `\\${folderPath}`;
 
         const foldersRes = await this.request<AzdoListResponse<AzdoBuildFolder>>(
@@ -2089,7 +2238,7 @@ export class AzureDevOpsApi {
             { ...opts, project: project ?? opts?.project, apiVersion: "7.2-preview.2" }
         );
         const existing = foldersRes.body.value.find(f => f.path === normalizedPath);
-        if (existing) return existing;
+        if (existing) return { ...existing, exists: true };
 
         const encodedPath = encodeURIComponent(normalizedPath);
         const res = await this.request<AzdoBuildFolder>(
@@ -2102,14 +2251,57 @@ export class AzureDevOpsApi {
                 body: { path: normalizedPath }
             }
         );
-        return res.body;
+        return { ...res.body, exists: false };
     }
 
     // =========================================================================
     // Pipelines — creation
     // =========================================================================
 
-    /** Crea un pipeline YAML asociado a un repositorio. */
+    /** Busca un pipeline por nombre en el proyecto. */
+    private async findPipeline(
+        project: string | undefined,
+        name: string,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoPipeline> | undefined> {
+        try {
+            const res = await this.request<AzdoListResponse<AzdoPipeline>>(
+                "GET",
+                "/pipelines",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    query: { name, ...opts?.query }
+                }
+            );
+            const pipeline = res.body.value.find(p => p.name === name);
+            return pipeline ? { ...res, body: pipeline } : undefined;
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                return undefined;
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * Verifica si un pipeline existe en el proyecto.
+     * Devuelve `{ exists: true, data }` si existe, `{ exists: false }` si no.
+     */
+    async pipelineExists(
+        project: string | undefined,
+        name: string,
+        opts?: AzdoRequestOptions
+    ): Promise<{ exists: boolean; data?: AzdoPipeline }> {
+        const found = await this.findPipeline(project, name, opts);
+        return found ? { exists: true, data: found.body } : { exists: false };
+    }
+
+    /**
+     * Crea un pipeline YAML asociado a un repositorio. Si ya existe un pipeline
+     * con el mismo nombre, no lanza el 409: devuelve el existente con
+     * `exists: true` en el body.
+     */
     async createPipeline(
         options: {
             project: string | undefined;
@@ -2120,32 +2312,39 @@ export class AzureDevOpsApi {
             defaultBranch?: string;
         },
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<unknown>> {
+    ): Promise<HttpResponse<AzdoPipeline & { exists: boolean }>> {
         const reposRes = await this.listRepos({ ...opts, project: options.project });
         const repo = reposRes.body.value.find(r => r.name === options.repository);
         if (!repo) {
             throw new Error(`Repository '${options.repository}' not found.`);
         }
 
-        return this.request("POST", "/pipelines", {
-            ...opts,
-            project: options.project,
-            apiVersion: "7.1-preview.1",
-            body: {
-                name: options.name,
-                folder: options.folder ?? "\\",
-                configuration: {
-                    type: "yaml",
-                    path: options.yamlPath,
-                    repository: {
-                        id: repo.id,
-                        type: "azureReposGit",
-                        name: repo.name,
-                        defaultBranch: options.defaultBranch ?? "refs/heads/main"
+        return this.createWithExistenceCheck(
+            () => this.findPipeline(options.project, options.name, opts),
+            () => this.request<AzdoPipeline>(
+                "POST",
+                "/pipelines",
+                {
+                    ...opts,
+                    project: options.project,
+                    apiVersion: "7.1-preview.1",
+                    body: {
+                        name: options.name,
+                        folder: options.folder ?? "\\",
+                        configuration: {
+                            type: "yaml",
+                            path: options.yamlPath,
+                            repository: {
+                                id: repo.id,
+                                type: "azureReposGit",
+                                name: repo.name,
+                                defaultBranch: options.defaultBranch ?? "refs/heads/main"
+                            }
+                        }
                     }
                 }
-            }
-        });
+            )
+        );
     }
 
     // =========================================================================
