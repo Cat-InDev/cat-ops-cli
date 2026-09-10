@@ -1799,6 +1799,225 @@ test("createEnvironment() envía POST con nombre y descripción", async () => {
 
 });
 
+test("createEnvironment() devuelve exists: true si el environment ya existe (sin POST)", async () => {
+
+    let postHit = false;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/distributedtask/environments": () => ({
+            count: 1,
+            value: [{ id: 10, name: "staging", description: "Staging environment", project: { id: "proj", name: "My Project" } }]
+        }),
+        "POST /my-project/_apis/distributedtask/environments": () => {
+            postHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createEnvironment(undefined, "staging", "Staging");
+
+        assert.equal(postHit, false, "no debe hacer POST si el environment ya existe");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 10);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createEnvironment() devuelve exists: true si el POST responde 409", async () => {
+
+    let postBody = null;
+    let getCalls = 0;
+
+    const existing = { id: 10, name: "staging", description: "Staging environment", project: { id: "proj", name: "My Project" } };
+
+    const { server, url } = await createMockServer({
+        "POST /my-project/_apis/distributedtask/environments": (_, body) => {
+            postBody = body;
+            return { statusCode: 409, body: { message: "environment already exists" } };
+        },
+        "GET /my-project/_apis/distributedtask/environments": () => {
+            getCalls++;
+            return getCalls === 1 ? { count: 0, value: [] } : { count: 1, value: [existing] };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createEnvironment(undefined, "staging", "Staging");
+
+        assert.ok(postBody, "debe intentar crear");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, 10, "debe devolver el environment existente en vez de fallar");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createEnvironment() devuelve exists: false cuando crea un environment nuevo", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/distributedtask/environments": () => ({ count: 0, value: [] }),
+        "POST /my-project/_apis/distributedtask/environments": (_, body) => ({
+            id: 10, name: body.name, description: body.description, project: { id: "proj", name: "My Project" }
+        })
+    });
+
+    const api = createApi(url);
+    const res = await api.createEnvironment(undefined, "staging", "Staging");
+
+    assert.equal(res.body.exists, false);
+    assert.equal(res.body.id, 10);
+
+    await closeServer(server);
+
+});
+
+// ===========================================================================
+// environmentExists()
+// ===========================================================================
+
+test("environmentExists() devuelve exists: true si existe", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/distributedtask/environments": () => ({
+            count: 1,
+            value: [{ id: 10, name: "staging", description: "", project: { id: "proj", name: "My Project" } }]
+        })
+    });
+
+    const api = createApi(url);
+    const result = await api.environmentExists(undefined, "staging");
+
+    assert.equal(result.exists, true);
+    assert.equal(result.data.id, 10);
+
+    await closeServer(server);
+
+});
+
+test("environmentExists() devuelve exists: false si no existe", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/distributedtask/environments": () => ({ count: 0, value: [] })
+    });
+
+    const api = createApi(url);
+    const result = await api.environmentExists(undefined, "missing");
+
+    assert.equal(result.exists, false);
+
+    await closeServer(server);
+
+});
+
+// ===========================================================================
+// createEnvironmentWithApprovals()
+// ===========================================================================
+
+test("createEnvironmentWithApprovals() crea environment + approval y devuelve exists: false", async () => {
+
+    let envCreated = false;
+    let approvalCreated = false;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/distributedtask/environments": () => ({ count: 0, value: [] }),
+        "POST /my-project/_apis/distributedtask/environments": (_, body) => {
+            envCreated = true;
+            return { id: 10, name: body.name, description: body.description, project: { id: "proj", name: "My Project" } };
+        },
+        "POST /_apis/IdentityPicker/Identities": () => ({
+            results: [{ identities: [{ displayName: "Contributors", samAccountName: "Contributors", localId: "id-1" }] }]
+        }),
+        "POST /my-project/_apis/pipelines/checks/configurations": () => {
+            approvalCreated = true;
+            return {};
+        }
+    });
+
+    const api = createApi(url);
+    const result = await api.createEnvironmentWithApprovals({
+        project: undefined,
+        environmentName: "staging",
+        approverGroup: "Contributors"
+    });
+
+    assert.equal(envCreated, true);
+    assert.equal(approvalCreated, true);
+    assert.equal(result.exists, false);
+    assert.equal(result.id, 10);
+
+    await closeServer(server);
+
+});
+
+test("createEnvironmentWithApprovals() con group 'none' no agrega approval", async () => {
+
+    let approvalCreated = false;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/distributedtask/environments": () => ({ count: 0, value: [] }),
+        "POST /my-project/_apis/distributedtask/environments": (_, body) => {
+            return { id: 10, name: body.name, description: body.description, project: { id: "proj", name: "My Project" } };
+        },
+        "POST /my-project/_apis/pipelines/checks/configurations": () => {
+            approvalCreated = true;
+            return {};
+        }
+    });
+
+    const api = createApi(url);
+    const result = await api.createEnvironmentWithApprovals({
+        project: undefined,
+        environmentName: "staging",
+        approverGroup: "none"
+    });
+
+    assert.equal(approvalCreated, false, "no debe crear approval con group 'none'");
+    assert.equal(result.exists, false);
+
+    await closeServer(server);
+
+});
+
+test("createEnvironmentWithApprovals() devuelve exists: true si el environment ya existe", async () => {
+
+    let approvalCreated = false;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/distributedtask/environments": () => ({
+            count: 1,
+            value: [{ id: 10, name: "staging", description: "Existing", project: { id: "proj", name: "My Project" } }]
+        }),
+        "POST /_apis/IdentityPicker/Identities": () => ({
+            results: [{ identities: [{ displayName: "Contributors", samAccountName: "Contributors", localId: "id-1" }] }]
+        }),
+        "POST /my-project/_apis/pipelines/checks/configurations": () => {
+            approvalCreated = true;
+            return {};
+        }
+    });
+
+    const api = createApi(url);
+    const result = await api.createEnvironmentWithApprovals({
+        project: undefined,
+        environmentName: "staging",
+        approverGroup: "Contributors"
+    });
+
+    assert.equal(result.exists, true);
+    assert.equal(result.id, 10);
+    // al existir, createEnvironment evita el POST; findIdentityGroup/approval aún se ejecutan
+    assert.equal(approvalCreated, true, "debe agregar approval sobre el environment existente");
+
+    await closeServer(server);
+
+});
+
 // ===========================================================================
 // findIdentityGroup()
 // ===========================================================================

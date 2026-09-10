@@ -1525,19 +1525,87 @@ export class AzureDevOpsApi {
     // Environments
     // =========================================================================
 
-    /** Crea un environment en un proyecto. */
-    createEnvironment(
+    /** Busca un environment por nombre en el proyecto. */
+    private async findEnvironment(
+        project: string | undefined,
+        name: string,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoEnvironment> | undefined> {
+        try {
+            const res = await this.request<AzdoListResponse<AzdoEnvironment>>(
+                "GET",
+                "/distributedtask/environments",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    apiVersion: "5.2-preview.1",
+                    query: { name, ...opts?.query }
+                }
+            );
+            const env = res.body.value.find(e => e.name === name);
+            return env ? { ...res, body: env } : undefined;
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                return undefined;
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * Verifica si un environment existe en el proyecto.
+     * Devuelve `{ exists: true, data }` si existe, `{ exists: false }` si no.
+     */
+    async environmentExists(
+        project: string | undefined,
+        name: string,
+        opts?: AzdoRequestOptions
+    ): Promise<{ exists: boolean; data?: AzdoEnvironment }> {
+        const found = await this.findEnvironment(project, name, opts);
+        return found ? { exists: true, data: found.body } : { exists: false };
+    }
+
+    /**
+     * Crea un environment en un proyecto. Si ya existe un environment con el
+     * mismo nombre, no lanza el error 409 de Azure: devuelve el existente con
+     * `exists: true` en el body.
+     */
+    async createEnvironment(
         project: string | undefined,
         name: string,
         description = "",
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<AzdoEnvironment>> {
-        return this.request("POST", "/distributedtask/environments", {
-            ...opts,
-            project: project ?? opts?.project,
-            apiVersion: "5.2-preview.1",
-            body: { name, description }
-        });
+    ): Promise<HttpResponse<AzdoEnvironment & { exists: boolean }>> {
+        const existing = await this.findEnvironment(project, name, opts);
+        if (existing) {
+            return { ...existing, body: { ...existing.body, exists: true } };
+        }
+
+        try {
+            const res = await this.request<AzdoEnvironment>(
+                "POST",
+                "/distributedtask/environments",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    apiVersion: "5.2-preview.1",
+                    body: { name, description }
+                }
+            );
+            return { ...res, body: { ...res.body, exists: false } };
+        } catch (err) {
+            // Race: entre el pre-check y el POST alguien creó el environment.
+            if (err && typeof err === "object" && "status" in err) {
+                const status = (err as { status: number }).status;
+                if (status === 409 || status === 400) {
+                    const found = await this.findEnvironment(project, name, opts);
+                    if (found) {
+                        return { ...found, body: { ...found.body, exists: true } };
+                    }
+                }
+            }
+            throw err;
+        }
     }
 
     /** Busca un grupo de identidades por nombre (SAM account name). */
@@ -1610,6 +1678,8 @@ export class AzureDevOpsApi {
     /**
      * Crea un environment con approvals.
      * Si `approverGroup` es `"none"`, no agrega approvals.
+     * Si el environment ya existe, lo devuelve con `exists: true` (sin crear ni
+     * duplicar approvals).
      */
     async createEnvironmentWithApprovals(
         options: {
@@ -1619,7 +1689,7 @@ export class AzureDevOpsApi {
             approverGroup: string;
         },
         opts?: AzdoRequestOptions
-    ): Promise<AzdoEnvironment> {
+    ): Promise<AzdoEnvironment & { exists: boolean }> {
         const envRes = await this.createEnvironment(
             options.project,
             options.environmentName,

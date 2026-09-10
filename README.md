@@ -690,6 +690,17 @@ const query = await azdo.queryWorkItems(
 // → query.body.workItems → [{ id, url }, ...]
 ```
 
+### Environments
+
+```typescript
+const env = await azdo.environmentExists("mi-proyecto", "staging");
+// → { exists: true, data } si existe · { exists: false } si no
+
+const created = await azdo.createEnvironment("mi-proyecto", "staging", "Staging environment");
+// si ya existe un environment con ese nombre, devuelve el existente con
+// created.body.exists === true en lugar de lanzar el 409 de Azure
+```
+
 ### Overrides por llamada
 
 Cada método acepta un objeto de opciones con `project`, `apiVersion`, `query`, `insecureTls` y `exec`:
@@ -746,7 +757,7 @@ Qué aporta cada pieza:
 
 Notas:
 
-- El error conserva `status`, `headers`, `body` y `request` del error HTTP original, así que los checks tipo `err.status === 404` siguen funcionando igual que siempre. Los helpers de existencia (`branchExists()`, `repoExists()`, `fileExists()`, `webhookExists()`) devuelven una propiedad `exists` en lugar de lanzar: `branchExists()` la expone en `body.exists`, y `repoExists()`/`fileExists()`/`webhookExists()` en `result.exists` (con `result.data` cuando existe).
+- El error conserva `status`, `headers`, `body` y `request` del error HTTP original, así que los checks tipo `err.status === 404` siguen funcionando igual que siempre. Los helpers de existencia (`branchExists()`, `repoExists()`, `fileExists()`, `webhookExists()`, `environmentExists()`) devuelven una propiedad `exists` en lugar de lanzar: `branchExists()` la expone en `body.exists`, y el resto en `result.exists` (con `result.data` cuando existe).
 - Detecta códigos TF/VS conocidos (`TF400813`, `TF401019`, `TF401027`, `TF401320`, `VS800075`, ...) con explicación y sugerencia específica; los desconocidos caen a sugerencias por status HTTP (401 → PAT expirado/org incorrecta, 404 → puede ser falta de permisos, 409 → `oldObjectId` desactualizado, 429 → throttling, etc.).
 - Aplana la cadena `innerException` del servidor en `detail.innerMessages`.
 - Soporta cuerpos no-JSON (proxies que devuelven HTML) y clasifica errores de red/timeout (`status: 0`) como `Red / Timeout`.
