@@ -2257,6 +2257,20 @@ const isApprovalCheck = (c: AzdoPolicyConfiguration) =>
         return { ...res.body, exists: false };
     }
 
+    /**
+     * Crea un folder de pipelines en el proyecto. En Azure DevOps los folders
+     * de la sección "Pipelines" se gestionan con la misma API de build folders,
+     * por lo que delega en {@link createBuildFolder}. Si el folder ya existe,
+     * no lo recrea: devuelve `exists: true`.
+     */
+    async createPipelinesFolder(
+        project: string | undefined,
+        folderPath: string,
+        opts?: AzdoRequestOptions
+    ): Promise<AzdoBuildFolder & { exists: boolean }> {
+        return this.createBuildFolder(project, folderPath, opts);
+    }
+
     // =========================================================================
     // Pipelines — creation
     // =========================================================================
@@ -2317,9 +2331,14 @@ const isApprovalCheck = (c: AzdoPolicyConfiguration) =>
         opts?: AzdoRequestOptions
     ): Promise<HttpResponse<AzdoPipeline & { exists: boolean }>> {
         const reposRes = await this.listRepos({ ...opts, project: options.project });
-        const repo = reposRes.body.value.find(r => r.name === options.repository);
+        const repo = reposRes.body.value.find(r => r.name === options.repository || r.id === options.repository);
         if (!repo) {
             throw new Error(`Repository '${options.repository}' not found.`);
+        }
+
+        const folder = options.folder ?? "\\";
+        if (folder !== "\\") {
+            await this.createBuildFolder(options.project, folder, opts);
         }
 
         return this.createWithExistenceCheck(
@@ -2333,7 +2352,7 @@ const isApprovalCheck = (c: AzdoPolicyConfiguration) =>
                     apiVersion: "7.1-preview.1",
                     body: {
                         name: options.name,
-                        folder: options.folder ?? "\\",
+                        folder,
                         configuration: {
                             type: "yaml",
                             path: options.yamlPath,
@@ -2354,30 +2373,73 @@ const isApprovalCheck = (c: AzdoPolicyConfiguration) =>
     // Service Connections
     // =========================================================================
 
-    /** Comparte un service endpoint con un proyecto. */
+    /** Busca si un service endpoint ya existe en un proyecto (p. ej. compartido). */
+    private async findServiceConnectionInProject(
+        project: string,
+        endpointId: string,
+        opts?: AzdoRequestOptions
+    ): Promise<HttpResponse<AzdoServiceEndpoint> | undefined> {
+        try {
+            const res = await this.request<AzdoListResponse<AzdoServiceEndpoint>>(
+                "GET",
+                "/serviceendpoint/endpoints",
+                {
+                    ...opts,
+                    project: project ?? opts?.project,
+                    apiVersion: "6.0-preview.4",
+                    query: { ...opts?.query }
+                }
+            );
+            const value = Array.isArray(res.body)
+                ? (res.body as AzdoServiceEndpoint[])
+                : res.body.value;
+            const endpoint = value.find(e => e.id === endpointId);
+            if (endpoint) return { ...res, body: endpoint };
+        } catch (err) {
+            if (err && typeof err === "object" && "status" in err && (err as { status: number }).status === 404) {
+                return undefined;
+            }
+            throw err;
+        }
+        return undefined;
+    }
+
+    /**
+     * Comparte un service endpoint con un proyecto.
+     * Si el endpoint ya existe en el proyecto destino, no lo duplica: devuelve
+     * el existente con `exists: true`.
+     */
     async shareServiceConnection(
         project: string,
         resourceId: string,
         resourceName: string,
         opts?: AzdoRequestOptions
-    ): Promise<HttpResponse<unknown>> {
+    ): Promise<HttpResponse<AzdoServiceEndpoint & { exists: boolean }>> {
         const projectRes = await this.getProject(project, { ...opts, organizationLevel: true });
         if (!projectRes.body) {
             throw new Error(`Project '${project}' not found.`);
         }
 
-        return this.request("PATCH", `/serviceendpoint/endpoints/${resourceId}`, {
-            ...opts,
-            organizationLevel: true,
-            apiVersion: "6.0-preview.4",
-            body: [
+        return this.createWithExistenceCheck<AzdoServiceEndpoint>(
+            () => this.findServiceConnectionInProject(project, resourceId, opts),
+            () => this.request(
+                "PATCH",
+                `/serviceendpoint/endpoints/${resourceId}`,
                 {
-                    description: "",
-                    name: `${resourceName}-${projectRes.body.name}`,
-                    projectReference: { id: projectRes.body.id, name: projectRes.body.name }
+                    ...opts,
+                    organizationLevel: true,
+                    apiVersion: "6.0-preview.4",
+                    body: [
+                        {
+                            description: "",
+                            name: `${resourceName}-${projectRes.body.name}`,
+                            projectReference: { id: projectRes.body.id, name: projectRes.body.name }
+                        }
+                    ]
                 }
-            ]
-        });
+            ),
+            opts
+        );
     }
 
     // =========================================================================

@@ -2415,6 +2415,55 @@ test("createBuildFolder() no crea si ya existe", async () => {
 });
 
 // ===========================================================================
+// createPipelinesFolder()
+// ===========================================================================
+
+test("createPipelinesFolder() crea un folder de pipelines nuevo", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/build/folders": () => ({
+            count: 0,
+            value: []
+        }),
+        "PUT /my-project/_apis/build/folders": () => ({
+            path: "\\CI\\Release",
+            project: { id: "proj" }
+        })
+    });
+
+    const api = createApi(url);
+    const result = await api.createPipelinesFolder(undefined, "CI\\Release");
+
+    assert.equal(result.path, "\\CI\\Release");
+    assert.equal(result.exists, false);
+
+    await closeServer(server);
+
+});
+
+test("createPipelinesFolder() no crea si el folder ya existe", async () => {
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/build/folders": () => ({
+            count: 1,
+            value: [{ path: "\\CI\\Release", project: { id: "proj" } }]
+        }),
+        "PUT /my-project/_apis/build/folders": () => {
+            throw new Error("no debería crear el folder");
+        }
+    });
+
+    const api = createApi(url);
+    const result = await api.createPipelinesFolder(undefined, "CI\\Release");
+
+    assert.equal(result.path, "\\CI\\Release");
+    assert.equal(result.exists, true);
+
+    await closeServer(server);
+
+});
+
+// ===========================================================================
 // createPipeline()
 // ===========================================================================
 
@@ -2522,6 +2571,92 @@ test("createPipeline() devuelve exists: true si el POST responde 409", async () 
         assert.ok(postBody, "debe intentar crear");
         assert.equal(res.body.exists, true);
         assert.equal(res.body.id, 100, "debe devolver el pipeline existente en vez de fallar");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createPipeline() crea el folder de destino antes del POST", async () => {
+
+    let putFolder = false;
+    let receivedBody = null;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories": () => ({
+            count: 1,
+            value: [{ id: "repo-1", name: "frontend", url: "https://x", defaultBranch: "refs/heads/main" }]
+        }),
+        "GET /my-project/_apis/build/folders": () => ({
+            count: 0,
+            value: []
+        }),
+        "PUT /my-project/_apis/build/folders": () => {
+            putFolder = true;
+            return { path: "\\CI\\Release", project: { id: "proj" } };
+        },
+        "POST /my-project/_apis/pipelines": (_, body) => {
+            receivedBody = body;
+            return { id: 100, name: body.name };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createPipeline({
+            project: undefined,
+            name: "CI Pipeline",
+            folder: "\\CI\\Release",
+            repository: "frontend",
+            yamlPath: "/azure-pipelines.yml"
+        });
+
+        assert.equal(putFolder, true, "debe crear el folder destino");
+        assert.equal(receivedBody.folder, "\\CI\\Release");
+        assert.equal(res.body.exists, false);
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("createPipeline() no recrea el folder si ya existe", async () => {
+
+    let putFolder = false;
+    let receivedBody = null;
+
+    const { server, url } = await createMockServer({
+        "GET /my-project/_apis/git/repositories": () => ({
+            count: 1,
+            value: [{ id: "repo-1", name: "frontend", url: "https://x", defaultBranch: "refs/heads/main" }]
+        }),
+        "GET /my-project/_apis/build/folders": () => ({
+            count: 1,
+            value: [{ path: "\\CI\\Release", project: { id: "proj" } }]
+        }),
+        "PUT /my-project/_apis/build/folders": () => {
+            putFolder = true;
+            return {};
+        },
+        "POST /my-project/_apis/pipelines": (_, body) => {
+            receivedBody = body;
+            return { id: 100, name: body.name };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.createPipeline({
+            project: undefined,
+            name: "CI Pipeline",
+            folder: "\\CI\\Release",
+            repository: "frontend",
+            yamlPath: "/azure-pipelines.yml"
+        });
+
+        assert.equal(putFolder, false, "no debe recrear el folder si ya existe");
+        assert.equal(receivedBody.folder, "\\CI\\Release");
+        assert.equal(res.body.exists, false);
     } finally {
         await closeServer(server);
     }
@@ -2736,6 +2871,101 @@ test("addAgentPoolToProject() lanza si el pool no existe", async () => {
             () => api.addAgentPoolToProject(undefined, "missing-pool"),
             /not found/i
         );
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+// ===========================================================================
+// shareServiceConnection()
+// ===========================================================================
+
+test("shareServiceConnection() comparte el endpoint y devuelve exists: false", async () => {
+
+    let patchBody = null;
+    let getCalls = 0;
+
+    const { server, url } = await createMockServer({
+        "GET /_apis/projects/my-project": () => ({ id: "proj-guid", name: "my-project" }),
+        "GET /my-project/_apis/serviceendpoint/endpoints": () => {
+            getCalls++;
+            return [];
+        },
+        "PATCH /_apis/serviceendpoint/endpoints/endpoint-1": (_, body) => {
+            patchBody = body;
+            return { id: "endpoint-1", name: "connection-my-project", type: "azurerm" };
+        }
+    });
+
+    const api = createApi(url);
+    const res = await api.shareServiceConnection("my-project", "endpoint-1", "connection");
+
+    assert.ok(patchBody, "debe compartir el endpoint vía PATCH");
+    assert.equal(patchBody.length, 1);
+    assert.equal(patchBody[0].name, "connection-my-project");
+    assert.deepEqual(patchBody[0].projectReference, { id: "proj-guid", name: "my-project" });
+    assert.equal(getCalls, 1);
+    assert.equal(res.body.exists, false);
+
+    await closeServer(server);
+
+});
+
+test("shareServiceConnection() devuelve exists: true si el endpoint ya está compartido (sin PATCH)", async () => {
+
+    let patchHit = false;
+
+    const { server, url } = await createMockServer({
+        "GET /_apis/projects/my-project": () => ({ id: "proj-guid", name: "my-project" }),
+        "GET /my-project/_apis/serviceendpoint/endpoints": () => ([
+            { id: "endpoint-1", name: "connection-my-project", type: "azurerm", projectReferences: [{ id: "proj-guid", name: "my-project" }] }
+        ]),
+        "PATCH /_apis/serviceendpoint/endpoints/endpoint-1": () => {
+            patchHit = true;
+            return {};
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.shareServiceConnection("my-project", "endpoint-1", "connection");
+
+        assert.equal(patchHit, false, "no debe compartir si el endpoint ya está en el proyecto");
+        assert.equal(res.body.exists, true);
+        assert.equal(res.body.id, "endpoint-1");
+    } finally {
+        await closeServer(server);
+    }
+
+});
+
+test("shareServiceConnection() devuelve exists: true si el PATCH responde 409", async () => {
+
+    let patchBody = null;
+    let getCalls = 0;
+
+    const existing = { id: "endpoint-1", name: "connection-my-project", type: "azurerm" };
+
+    const { server, url } = await createMockServer({
+        "GET /_apis/projects/my-project": () => ({ id: "proj-guid", name: "my-project" }),
+        "GET /my-project/_apis/serviceendpoint/endpoints": () => {
+            getCalls++;
+            return getCalls === 1 ? [] : [existing];
+        },
+        "PATCH /_apis/serviceendpoint/endpoints/endpoint-1": (_, body) => {
+            patchBody = body;
+            return { statusCode: 409, body: { message: "endpoint already shared" } };
+        }
+    });
+
+    try {
+        const api = createApi(url);
+        const res = await api.shareServiceConnection("my-project", "endpoint-1", "connection");
+
+        assert.ok(patchBody, "debe intentar compartir");
+        assert.equal(res.body.exists, true, "debe devolver el endpoint existente en vez de fallar");
+        assert.equal(res.body.id, "endpoint-1");
     } finally {
         await closeServer(server);
     }

@@ -701,7 +701,7 @@ const created = await azdo.createEnvironment("mi-proyecto", "staging", "Staging 
 // created.body.exists === true en lugar de lanzar el 409 de Azure
 ```
 
-> **Creación idempotente**: todos los métodos `create*` validan existencia antes de crear y devuelven el recurso existente con `exists: true` en lugar de lanzar el error 409 de Azure (y si Azure responde 409 por un race, recuperan el existente). Esto aplica a `createPullRequest()`, `createEnvironment()`, `createEnvironmentWithApprovals()`, `createEnvironmentApproval()`, `createWebhook()`, `createPipeline()`, `createVariableGroup()`, `createBuildFolder()`, `createFileInRepo()`, `addAgentPoolToProject()` y `overrideAgentPoolToProject()`.
+> **Creación idempotente**: todos los métodos `create*` validan existencia antes de crear y devuelven el recurso existente con `exists: true` en lugar de lanzar el error 409 de Azure (y si Azure responde 409 por un race, recuperan el existente). Esto aplica a `createPullRequest()`, `createEnvironment()`, `createEnvironmentWithApprovals()`, `createEnvironmentApproval()`, `createWebhook()`, `createPipeline()`, `createVariableGroup()`, `createBuildFolder()`, `createPipelinesFolder()`, `createFileInRepo()`, `addAgentPoolToProject()`, `overrideAgentPoolToProject()` y `shareServiceConnection()`.
 
 ### Overrides por llamada
 
