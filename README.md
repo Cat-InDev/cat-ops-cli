@@ -424,6 +424,171 @@ await ctx.services.docker.validateSpace({ images: 8 * 1e9 }, undefined, true);
 
 Los umbrales y los tamaños del `systemDf` se expresan en **bytes** (con `parseSize` que normaliza `KB/MB/GB/TB`). Todas las funciones aceptan `exec` (retry/timeout/dryRun) como antes.
 
+## Git (`ctx.services.git`)
+
+`ctx.services.git` cubre el flujo completo de trabajo con git: `clone`, `checkout`, creación/borrado/listado de **ramas**, `pull`/`fetch`, `add`/`commit`/`push`, `tag`, `merge`/`rebase`, `status`/`log`/`diff`/`show`, `remote`, `stash`, `reset`, `init`, `config` y `revParse`.
+
+Todas las funciones aceptan `exec` (retry/timeout/dryRun) como último argumento plano (`git.push({ retry: 3 })`) o embebido en el objeto de opciones (`git.commit({ exec: { retry: 3 } })`).
+
+```javascript
+// clone — con rama y profundidad opcionales
+await ctx.services.git.clone("https://github.com/org/repo.git", "./repo");
+await ctx.services.git.clone("https://github.com/org/repo.git", "./repo", {
+    branch: "dev", depth: 1, singleBranch: true
+});
+
+// checkout — pasarse de rama, o crearla y pasarse
+await ctx.services.git.checkout("develop");
+await ctx.services.git.checkout("feat/api", { create: true });          // git checkout -b feat/api
+await ctx.services.git.checkout("dev", { create: true, track: true, startPoint: "origin/dev" });
+```
+
+**Ramas** — `branch` (genérico) y helpers dedicados `branchCreate`, `branchDelete`, `branchRename`, `branchList`, `branchShowCurrent`, `branchSetUpstream`, `branchUnsetUpstream`:
+
+```javascript
+// Crear
+await ctx.services.git.branchCreate("feat/x", { startPoint: "main" });
+await ctx.services.git.branchCreate("feat/x", { startPoint: "origin/main", track: true });
+await ctx.services.git.branchCreate("hotfix", { force: true });          // git branch -f hotfix
+
+// Borrar (con -D si usás force) y renombrar
+await ctx.services.git.branchDelete("feat/x");
+await ctx.services.git.branchDelete("legacy", { force: true });          // git branch -D legacy
+await ctx.services.git.branchRename("feature/x");                        // renombra la rama actual
+await ctx.services.git.branchRename("feature/x", { oldName: "feat/x" });
+await ctx.services.git.branchRename("feature/x", { oldName: "feat/x", force: true }); // -M
+
+// Listar
+await ctx.services.git.branchList({ all: true });                        // git branch -a
+await ctx.services.git.branchList({ remote: true, verbose: true });      // git branch -r -vv
+await ctx.services.git.branchList({ merged: "main" });                   // las ya fusionadas en main
+await ctx.services.git.branchList({ noMerged: true, pattern: "feat*" });
+await ctx.services.git.branchList({ contains: "abc123", sort: "-committerdate" });
+
+// Actual y upstream
+const current = await ctx.services.git.branchShowCurrent();              // git branch --show-current
+await ctx.services.git.branchSetUpstream({ upstream: "origin/main" });   // git branch -u origin/main
+await ctx.services.git.branchSetUpstream({ upstream: "origin/main", name: "dev" });
+await ctx.services.git.branchUnsetUpstream();                            // git branch --unset-upstream
+```
+
+**pull / fetch** — con remote, rama y estrategia:
+
+```javascript
+await ctx.services.git.pull();                                           // git pull
+await ctx.services.git.pull({ remote: "origin", branch: "main", rebase: true });
+await ctx.services.git.pull({ remote: "origin", branch: "main", ffOnly: true });
+await ctx.services.git.pull({ prune: true, tags: true });
+
+await ctx.services.git.fetch();                                          // git fetch --all (default)
+await ctx.services.git.fetch({ remote: "origin", branch: "develop" });
+await ctx.services.git.fetch({ depth: 1, tags: true });
+await ctx.services.git.fetch({ prune: true });
+```
+
+**add / commit / push** — `add` acepta un arreglo de archivos o `"."`; `commit` hace el `add` automáticamente si le pasás archivos:
+
+```javascript
+// add
+await ctx.services.git.add(".");
+await ctx.services.git.add(["src/", "package.json"]);
+await ctx.services.git.add(".", { all: true });                          // git add -A .
+await ctx.services.git.add(["src/"], { force: true });                   // git add -f src/
+
+// commit — si recibís archivos, los agrega solos antes de commitear
+await ctx.services.git.commit("fix: corrección de login");
+await ctx.services.git.commit("feat: api", ["src/api/**"], { amend: false });
+await ctx.services.git.commit("feat: todo", { files: ".", allowEmpty: true });
+await ctx.services.git.commit("wip", ".", { exec: { retry: 2 } });
+await ctx.services.git.commit("release", { all: true, amend: true });    // git commit -a --amend
+
+// push — remote y rama posicionales u opcionales
+await ctx.services.git.push();                                           // git push
+await ctx.services.git.push("origin");                                   // git push origin
+await ctx.services.git.push("origin", "main");                           // git push origin main
+await ctx.services.git.push({ remote: "origin", branch: "main", setUpstream: true }); // -u
+await ctx.services.git.push({ remote: "origin", branch: "main", force: true });       // --force
+await ctx.services.git.push({ remote: "origin", branch: "main", forceWithLease: true });
+await ctx.services.git.push({ tags: true });                             // git push --tags
+```
+
+**tags**:
+
+```javascript
+await ctx.services.git.tag("v1.0.0");                                    // git tag v1.0.0
+await ctx.services.git.tag("v1.0.0", { message: "release 1.0" });        // anotada
+await ctx.services.git.tag("v1.0.0", { message: "release", force: true });
+await ctx.services.git.tagDelete("v1.0.0");                              // git tag -d v1.0.0
+await ctx.services.git.tagList({ pattern: "v1.*", sort: "-creatordate" });
+```
+
+**merge / rebase**:
+
+```javascript
+await ctx.services.git.merge("develop");
+await ctx.services.git.merge("develop", { noEdit: true });
+await ctx.services.git.merge("main", { ffOnly: true });                  // aborta si no es fast-forward
+await ctx.services.git.merge({ abort: true });                           // aborta el merge en conflicto
+
+await ctx.services.git.rebase({ branch: "main" });                       // git rebase main
+await ctx.services.git.rebase({ branch: "dev", onto: "main" });
+await ctx.services.git.rebase({ interactive: true });
+await ctx.services.git.rebase({ abort: true });                          // aborta el rebase en curso
+```
+
+**status / log / diff / show**:
+
+```javascript
+await ctx.services.git.status();
+await ctx.services.git.status({ short: true, branch: true });            // git status -sb
+await ctx.services.git.status({ porcelain: true });                      // para scripting
+
+await ctx.services.git.log({ maxCount: 10, oneline: true });             // git log --max-count 10 --oneline
+await ctx.services.git.log({ since: "2 weeks ago", author: "miuser" });
+await ctx.services.git.log({ graph: true, allBranches: true });
+
+await ctx.services.git.diff({ stat: true });                             // git diff --stat
+await ctx.services.git.diff({ cached: true });                           // staged
+await ctx.services.git.diff({ nameOnly: true });                         // solo archivos
+
+await ctx.services.git.show("HEAD");                                     // git show HEAD
+await ctx.services.git.show("abc123", { stat: true });                   // git show --stat abc123
+```
+
+**remote / stash / reset / init / config / revParse**:
+
+```javascript
+// remote
+await ctx.services.git.remote({ verbose: true });                        // git remote -v
+await ctx.services.git.remote({ show: "origin" });                       // git remote show origin
+await ctx.services.git.remoteAdd("upstream", "https://github.com/org/repo.git");
+await ctx.services.git.remoteRemove("upstream");
+await ctx.services.git.remoteSetUrl("origin", "git@github.com:org/repo.git");
+
+// stash
+await ctx.services.git.stashPush({ message: "wip", includeUntracked: true });
+await ctx.services.git.stashPush({ keepIndex: true });
+await ctx.services.git.stashList();
+await ctx.services.git.stashPop();                                       // git stash pop
+await ctx.services.git.stashPop({ index: 1 });                           // git stash pop stash@{1}
+await ctx.services.git.stashApply({ index: 0 });
+await ctx.services.git.stashDrop({ index: 2 });
+
+// reset / init / config
+await ctx.services.git.reset({ mode: "hard", commit: "HEAD~1" });        // git reset --hard HEAD~1
+await ctx.services.git.init({ initialBranch: "main" });                  // git init -b main
+await ctx.services.git.configSet("user.name", "Cat");
+await ctx.services.git.configGet("user.name");
+await ctx.services.git.configList();
+
+// revParse — resuelve refs (default HEAD)
+const sha = await ctx.services.git.revParse();                           // git rev-parse HEAD
+await ctx.services.git.revParse("HEAD~1");
+await ctx.services.git.revParse({ short: true });                        // SHA abreviado
+await ctx.services.git.revParse({ abbrevRef: true });                    // nombre de la rama actual
+await ctx.services.git.revParse({ showTopLevel: true });                 // raíz absoluta del repo
+```
+
 ## kubectl / oc: kubeconfig, namespace, retry/timeout, y espera cíclica del rollout
 
 `kubectl` y `oc` aceptan `{ kubeconfig, namespace, exec }` como último argumento en **todos** sus comandos (retrocompatible, sigue funcionando sin ese argumento — ver la sección anterior para el detalle de `exec`):
