@@ -130,6 +130,13 @@ test("isTextFile() y shouldOmit() distinguen texto/binario y rutas omitidas", ()
     assert.equal(shouldOmit("/src/main.ts", [".vscode"]), false);
     assert.equal(shouldOmit("/docs/a/b.md", ["docs"]), true);
     assert.equal(shouldOmit("/azure-pipelines.yml", [".vscode"]), false);
+
+    assert.equal(shouldOmit("/azure-pipelines.yml", ["**/azure-pipelines*.y*"]), true);
+    assert.equal(shouldOmit("/pipelines/azure-pipelines.dev.yml", ["**/azure-pipelines*.y*"]), true);
+    assert.equal(shouldOmit("/src/main.ts", ["**/azure-pipelines*.y*"]), false);
+    assert.equal(shouldOmit("/infra/main.tf", ["**/azure-pipelines*.y*", "infra"]), true);
+    assert.equal(shouldOmit("/azure-pipelines.yml", ["**/azure-pipelines*.y*", "infra"]), true);
+    assert.equal(shouldOmit("/src/main.ts", ["**/azure-pipelines*.y*", "infra"]), false);
 });
 
 test("RepositoryWorkspace clona sin compartir Buffers", () => {

@@ -107,8 +107,11 @@ function hasNullBytes(content: Buffer): boolean {
 
 /**
  * Indica si una ruta debe omitirse según la lista de patrones `omit`.
- * Acepta archivos exactos (`".gitignore"`) y carpetas (`".vscode"`,
- * `"docs"`, ...) — la omisión aplica a la carpeta y todo su contenido.
+ * Acepta archivos exactos (`".gitignore"`), carpetas (`".vscode"`,
+ * `"docs"`, ... — la omisión aplica a la carpeta y todo su contenido) y
+ * globs tipo gitignore: un `*` no cruza carpetas; un globstar (doble `*`)
+ * cruza cualquier profundidad y, seguido de `/`, cubre también la raíz
+ * (p.ej. así omite `azure-pipelines*.y*` en cualquier nivel).
  */
 export function shouldOmit(path: string, omit?: string[]): boolean {
     if (!omit || omit.length === 0) return false;
@@ -116,9 +119,52 @@ export function shouldOmit(path: string, omit?: string[]): boolean {
     return omit.some(pattern => {
         const p = String(pattern).replace(/^\/+/, "").replace(/\/+$/, "");
         if (!p) return false;
+        if (hasGlobMagic(p)) {
+            return globToRegExp(p).test(normalized);
+        }
         if (normalized === p) return true;
         return normalized.startsWith(`${p}/`);
     });
+}
+
+/** Indica si un patrón contiene caracteres glob que requieren regex. */
+function hasGlobMagic(pattern: string): boolean {
+    return /[*?]/.test(pattern);
+}
+
+const GLOB_REGEX_ESCAPE = "\\.+(){}[]^$|";
+
+/**
+ * Convierte un patrón glob (limitado a `*` y `?`, y a un globstar: doble
+ * `*`) a RegExp anclada. `*` no cruza segmentos; el globstar cruza
+ * cualquier profundidad y, si va seguido de `/`, también casa con la raíz
+ * (p.ej. `azure-pipelines.yml` del toplevel).
+ */
+function globToRegExp(pattern: string): RegExp {
+    let re = "";
+    for (let i = 0; i < pattern.length; i++) {
+        const ch = pattern[i];
+        if (ch === "*") {
+            if (pattern[i + 1] === "*") {
+                while (pattern[i + 1] === "*") i++;
+                if (pattern[i + 1] === "/") {
+                    i++;
+                    re += "(?:[^/]+/)*";
+                } else {
+                    re += ".*";
+                }
+            } else {
+                re += "[^/]*";
+            }
+        } else if (ch === "?") {
+            re += "[^/]";
+        } else if (GLOB_REGEX_ESCAPE.includes(ch)) {
+            re += "\\" + ch;
+        } else {
+            re += ch;
+        }
+    }
+    return new RegExp(`^${re}$`);
 }
 
 // ---------------------------------------------------------------------------

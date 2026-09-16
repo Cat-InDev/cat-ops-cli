@@ -619,7 +619,38 @@ const file = await azdo.fileExists("mi-proyecto", "frontend", "main", "/src/inde
 
 await azdo.createFileInRepo("mi-proyecto", "frontend", "main", "README.md", "/", "$README:TEMPLATE");
 // crea solo si no existe; usa overrideFileInRepo() para sobrescribir
+
+#### Basing (`mergeWithTemplate`)
+
+`mergeWithTemplate()` basa un repositorio destino en un template: descarga
+origen y destino, copia los archivos del template sobre el destino — respetando
+`overwrite`, `deleteExtra` y `filters.omit`—, aplica opcionalmente una
+transformación y publica el resultado en un único commit. Si no hay
+diferencias, no hace push.
+
+```typescript
+await azdo.mergeWithTemplate({
+    project: "mi-proyecto",
+    repository: "frontend",
+    targetBranch: "main",
+    template: { project: "shared", repository: "camaleon", branch: "main" },
+    filters: { omit: ["**/azure-pipelines*.y*", "infra"] }, // no copiar pipelines ni la carpeta infra
+    overwrite: true,        // true por defecto: pisa archivos existentes
+    deleteExtra: false,     // false por defecto: no borra archivos que el template no tiene
+    transform: (file) => {
+        if (file.path === "/azure-pipelines.yml") {
+            file.content = Buffer.from("name: " + repo);
+        }
+    },
+    comment: "feat: sincronizar con camaleon"
+});
+// → { message: "Applied N changes", changes: [...] }  |  { message: "No changes", changes: [] }
 ```
+
+Los patrones de `filters.omit` soportan globs tipo gitignore:
+`*` no cruza carpetas, un globstar (`**`) cruza cualquier profundidad y,
+seguido de `/`, cubre también la raíz. Los nombres de carpeta (`"infra"`)
+omiten la carpeta y todo su contenido.
 
 ### Branches
 
@@ -1670,6 +1701,7 @@ npm test
 - `azdo-api.test.js` — AzureDevOpsApi contra mock server: proyectos, repos, branches, commits, PRs, builds, pipelines, work items, overrides
 - `azdo-errors.test.js` — parser de errores de Azure DevOps: extracción de message/typeKey/código TF/VS, innerException aplanada, cuerpos no-JSON, errores de red, formato legible, compatibilidad de los checks de 404 tras el wrap
 - `azdo-interceptors.test.js` — interceptores del agente HTTP de AzureDevOpsApi: vía configure() y vía métodos add/remove/clear, cola perezosa antes del primer request, agente externo compartido, error descriptivo con agentes sin soporte
+- `azdo-template.test.js` — mergeWithTemplate(): add/edit/delete en un único push, filters.omit (carpetas y globs tipo `**/azure-pipelines*.y*`), overwrite, transform previa a la comparación, repo vacío
 - `pipeline.test.js` — Pipeline motor: stages/jobs/tasks, dependencias cross-level con paths dotted, resultados jerárquicos (stage.job.task), fluent API, registry, reset, ctx access, detección de tipo por propiedad, PipelineResultsAccessor
 - `service-notify.test.js` — ServiceError, ctx.wrap(), Notifier con service/method/args, classifiers.byService/messages.byService, unwrap de ServiceError en byCommand/byPattern/byRule, integración completa, backward compat
 - `yaml.test.js` — YamlService: fromYaml/fromJson, yamlGet/yamlSet/yamlPush/yamlOmit, comment(), prepare() con $set/$push/$spread/$superSet/$merge/$delete, multidocument/use/clone
