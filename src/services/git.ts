@@ -390,7 +390,7 @@ export async function commit(message: string, ...rest: Array<string[] | string |
     if (options.all) args.push("-a");
     if (options.allowEmpty) args.push("--allow-empty");
     if (options.amend) args.push("--amend");
-    args.push("-m", message);
+    args.push("-m", `'${message}'`);
     return gitExec(args, exec, options.dir);
 }
 
