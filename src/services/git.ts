@@ -110,10 +110,10 @@ export function checkout(branch: string, opts: GitCheckoutOptions | ExecOptions 
     const { options, exec } = lastOptions<GitCheckoutOptions>(opts);
     const args = ["checkout"];
     if (options.create) args.push("-b");
+    args.push(branch);
     if (options.track) args.push("--track");
     if (options.force) args.push("-f");
     if (options.detach) args.push("--detach");
-    args.push(branch);
     if (options.startPoint) args.push(options.startPoint);
     return gitExec(args, exec, options.dir);
 }
