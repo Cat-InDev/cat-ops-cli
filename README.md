@@ -9,7 +9,7 @@ Trae:
 - **Servicio HTTP** con interceptores de request/response, registry de agentes nombrados, configuración global, query params, dry-run y timeout. Los interceptores también se pueden registrar sobre el agente que integra `AzureDevOpsApi`. Modo TLS inseguro (`insecureTls`) para servidores con certificado autofirmado o CA interna no confiable.
 - **Parser de errores de Azure DevOps**: cada fallo de la REST API se convierte en un `AzdoApiError` legible con el mensaje del servidor, código TF/VS, tipo de excepción y sugerencias accionables (`parseAzdoError` / `formatAzdoError`).
 - **Menús interactivos** con navegación anidada y **selección automática por flag** (para correr pipelines sin prompts, ideal para CI).
-- **retry / timeout / dryRun / env** en cada comando de shell.
+- **retry / timeout / dryRun / env / cwd** en cada comando de shell, más **shell compartido** (`runner`) para ejecutar servicios en un mismo directorio/entorno.
 - Validación cíclica de rollouts de Kubernetes/OpenShift (`waitForDeployment`, `waitForDeploymentGroup`).
 - **Callbacks de éxito/error por tarea** + un sistema de **notificaciones clasificadas por área de TI**, con mensajes personalizables y senders (`log`, `file`, `http`, `webhook`, `websocket`). Incluye `ctx.wrap()` para monitoreo automático de servicios con metadata de servicio/método/argumentos.
 
@@ -254,7 +254,7 @@ await ctx.run(
 
 En ambos casos, además de tus callbacks, el resultado se reporta automáticamente al `ctx.notifier` (ver más abajo) — no hay que llamarlo a mano.
 
-## retry / timeout / dryRun / env — en shell.exec y en TODOS los servicios
+## retry / timeout / dryRun / env / cwd — en shell.exec y en TODOS los servicios
 
 `shell.exec(command, ...args)` sigue aceptando exactamente los mismos argumentos de siempre. Si el último argumento es un objeto plano, se interpreta como opciones **solo para esa llamada**:
 
@@ -300,6 +300,55 @@ ctx.services.shell.env("DOCKER_CONFIG", "/ruta/config");
 ```
 
 La jerarquía es: `process.env` → `ctx.env` (global) → `exec.env` (por llamada).
+
+### Directorio de trabajo (`cwd`)
+
+`cwd` ejecuta el comando en una carpeta puntual, como si hicieras `cd` antes del comando. Vale para **cualquier** comando de **cualquier** servicio, directo en `shell.exec` o vía `exec.cwd`:
+
+```javascript
+// Directo en shell
+await ctx.services.shell.exec("git", "status", { cwd: "/ruta/del/repo" });
+
+// En un servicio, vía exec (funciona con kubectl, docker, helm, oc, ...)
+await ctx.services.kubectl.apply("deploy.yaml", {
+    exec: { cwd: "/ruta/repo/infra", retry: 3 }
+});
+
+// Git acepta cwd directamente en su objeto de opciones
+await ctx.services.git.status({ cwd: "./repo" });
+await ctx.services.git.pull({ remote: "origin", branch: "main", cwd: "/ruta/repo" });
+```
+
+`cwd` puede ser **absoluto** o **relativo** (resuelve contra el directorio actual del shell). También se puede fijar como default global:
+
+```javascript
+ctx.services.shell.configure({ cwd: "/ruta/repo" }); // todos los comandos corren ahí por defecto
+```
+
+### Shell compartido (`runner`)
+
+Para flujos donde varios servicios deben correr en un mismo directorio/entorno (p. ej. despliegue GitOps: clonar, configurar, aplicar), podés crear un **shell compartido** con su propio `cd` y pasárselo a los siguientes comandos. Se crea con `shell.clone()`, se hace `cd` con `sh.cwd(...)`, y se pasa como `runner`:
+
+```javascript
+// Un shell compartido apuntando al repo
+const sh = ctx.services.shell.clone();
+sh.cwd("/ruta/repo");               // cd a la carpeta que tiene el .git
+sh.env("MY_CONTEXT", "prod");       // entorno propio del shell compartido
+
+// El siguiente servicio usa ESE shell (mismo directorio + entorno)
+await ctx.services.git.status({ runner: sh });
+await ctx.services.git.branchCreate("feat/gitops", { runner: sh, checkout: true });
+await ctx.services.npm.ci({ exec: { runner: sh } });       // también vía exec
+await ctx.services.docker.build({ image: "app:v1", exec: { runner: sh } });
+```
+
+El `runner` conserva su propio `cd`/env **entre llamadas** (hasta que lo cambies con `sh.cwd(...)`), mientras que `cwd` solo aplica a esa llamada puntual. Ambos coexisten: `cwd` tiene prioridad sobre el directorio del runner. El shell compartido hace lo mismo que el default (`clone`, `cwd`, `env`, `configure`, `exec`), y al pasarlo como `runner` no tocas el shell global.
+
+```javascript
+// Combinado: runner para varios pasos + cwd puntual para uno solo
+await ctx.services.git.add(".", { runner: sh });
+await ctx.services.git.commit("fix: quota", { runner: sh, exec: { cwd: "/tmp/otro-repo" } });
+```
 
 **Todos los comandos de todos los servicios** (`docker`, `git`, `kubectl`, `helm`, `npm`, `archive`, `terraform`, `ansible`, `argocd`, `tekton`, `oc`, `az`) aceptan este mismo control, sin que cambie nada de lo que ya usabas:
 
@@ -428,7 +477,7 @@ Los umbrales y los tamaños del `systemDf` se expresan en **bytes** (con `parseS
 
 `ctx.services.git` cubre el flujo completo de trabajo con git: `clone`, `checkout`, creación/borrado/listado de **ramas**, `pull`/`fetch`, `add`/`commit`/`push`, `tag`, `merge`/`rebase`, `status`/`log`/`diff`/`show`, `remote`, `stash`, `reset`, `init`, `config` y `revParse`.
 
-Todas las funciones aceptan `exec` (retry/timeout/dryRun) como último argumento plano (`git.push({ retry: 3 })`) o embebido en el objeto de opciones (`git.commit({ exec: { retry: 3 } })`).
+Todas las funciones aceptan `exec` (retry/timeout/dryRun) como último argumento plano (`git.push({ retry: 3 })`) o embebido en el objeto de opciones (`git.commit({ exec: { retry: 3 } })`). También aceptan `cwd` y `runner` a nivel de opciones (`git.status({ cwd: "./repo" })`), sin necesidad de anidarlos en `exec`.
 
 ```javascript
 // clone — con rama y profundidad opcionales
@@ -625,6 +674,37 @@ await ctx.run("deploy-api", async () => {
         maxRestarts: 5                // si supera 5 reinicios acumulados, aborta ya
     });
 });
+```
+
+Con `printEvents`, antes de lanzar el error imprime los eventos para saber **qué** está fallando (ImagePullBackOff, FailedScheduling, probes, cuota, etc.). `true` imprime los del deployment y los de cada uno de sus pods; también se puede elegir: `{ deployment: true, pods: true }`. `waitForDeploymentGroup` acepta la misma opción para cada instancia que falle.
+
+```javascript
+await ctx.services.oc.waitForDeployment({
+    deployment: "api",
+    namespace: "prod",
+    printEvents: { deployment: true, pods: true }
+});
+```
+
+### Logs y eventos
+
+```javascript
+const { kubectl, oc } = ctx.services;
+
+// Igual que antes: solo el log actual (result.stdout / result.current)
+await kubectl.logs("api-7d9f", { namespace: "prod" });
+
+// Log actual + el del contenedor anterior (--previous). Si no hay contenedor
+// anterior, `previous` queda en "" en vez de fallar.
+const { current, previous } = await oc.logs("api-7d9f", { namespace: "prod", previous: true, container: "app", tail: 200 });
+
+// Solo el anterior
+await oc.logs("api-7d9f", { current: false, previous: true });
+
+// Eventos (ordenados por fecha; `warningsOnly: true` filtra solo Warning)
+await oc.events({ namespace: "prod" });                                // de todo el namespace
+await oc.podEvents("api-7d9f", { namespace: "prod" });                 // de un pod
+await oc.deploymentEvents("api", { namespace: "prod", resourceType: "dc" }); // de un deployment/dc
 ```
 
 ### `waitForDeploymentGroup` — validar todas las instancias de un mismo despliegue GitOps

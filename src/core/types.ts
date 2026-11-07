@@ -15,6 +15,32 @@ export interface ExecResult {
     args?: string[];
 }
 
+/** Shell que mantiene su propio contexto (cwd/env) y puede compartirse entre servicios. */
+export interface ShellRunner {
+    /** Directorio de trabajo actual (`cd`) del shell. */
+    cwdPath: string;
+    /** Ejecuta el comando en el contexto de este shell. */
+    exec(command: string, ...rawArgs: Array<string | ExecOptions>): Promise<ExecResult>;
+    /** Verifica si existe un archivo/carpeta (resuelto contra el cwd del shell). */
+    exists(file: string, options?: ExecOptions): Promise<boolean>;
+    /** Crea un directorio (recursivo) en el contexto de este shell. */
+    mkdir(dir: string, options?: ExecOptions): Promise<void>;
+    /** Elimina un archivo/carpeta en el contexto de este shell. */
+    remove(target: string, options?: ExecOptions): Promise<void>;
+    /** Copia un archivo/carpeta en el contexto de este shell. */
+    copy(from: string, to: string, options?: ExecOptions): Promise<void>;
+    /** Mueve/renombra un archivo/carpeta en el contexto de este shell. */
+    move(from: string, to: string, options?: ExecOptions): Promise<void>;
+    /** Lee un archivo en el contexto de este shell. */
+    read(file: string, options?: ExecOptions): Promise<string>;
+    /** Escribe un archivo en el contexto de este shell. */
+    write(file: string, data: string, options?: ExecOptions): Promise<void>;
+    /** Imprime un mensaje en el log y lo devuelve. */
+    echo(message: string, options?: ExecOptions): Promise<string>;
+    /** Lista un directorio en el contexto de este shell. */
+    ls(dir?: string, options?: ExecOptions): Promise<string[]>;
+}
+
 export interface ExecOptions {
     /** Número total de intentos (1 = sin retry). Default: 1 */
     retry?: number;
@@ -28,6 +54,10 @@ export interface ExecOptions {
     shell?: boolean;
     /** Variables de entorno adicionales para este llamada. Se fusionan con el entorno actual. */
     env?: NodeJS.ProcessEnv;
+    /** Directorio de trabajo para esta llamada puntual (equivale a un `cd` antes del comando). */
+    cwd?: string;
+    /** Shell compartido (con su propio `cd`/env) en el que ejecutar este comando. */
+    runner?: ShellRunner;
 }
 
 // ---------------------------------------------------------------------------

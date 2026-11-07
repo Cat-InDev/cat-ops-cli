@@ -344,3 +344,141 @@ test("kubectl.waitForDeploymentGroup lanza error si el label no matchea ningún 
     mock.restore();
 
 });
+
+// ---------------------------------------------------------------------------
+// logs (actual / anterior) y eventos
+// ---------------------------------------------------------------------------
+
+test("kubectl.logs por defecto solo trae el log actual (compatible con antes)", async () => {
+
+    const capture = captureExec();
+
+    const result = await kubectl.logs("api-1", { namespace: "prod" });
+
+    capture.restore();
+
+    assert.equal(capture.calls.length, 1);
+    assert.deepEqual(capture.calls[0], ["kubectl", "logs", "api-1", "-n", "prod"]);
+    assert.equal(result.current, "{}");
+    assert.equal(result.previous, "");
+
+});
+
+test("kubectl.logs con previous trae actual y --previous", async () => {
+
+    const original = shell.exec.bind(shell);
+    const calls = [];
+
+    shell.exec = (...args) => {
+        calls.push(args);
+        const isPrevious = args.includes("--previous");
+        return Promise.resolve({ code: 0, stdout: isPrevious ? "prev-log" : "curr-log", stderr: "" });
+    };
+
+    try {
+        const result = await kubectl.logs("api-1", { previous: true, container: "app", tail: 50 });
+        assert.equal(result.current, "curr-log");
+        assert.equal(result.previous, "prev-log");
+        assert.deepEqual(calls[1], ["kubectl", "logs", "api-1", "-c", "app", "--tail", "50", "--previous"]);
+    } finally {
+        shell.exec = original;
+    }
+
+});
+
+test("kubectl.logs con previous retorna vacío si no existe contenedor anterior", async () => {
+
+    const original = shell.exec.bind(shell);
+
+    shell.exec = (...args) => args.includes("--previous")
+        ? Promise.reject({ code: 1, stdout: "", stderr: 'previous terminated container "app" in pod "api-1" not found' })
+        : Promise.resolve({ code: 0, stdout: "curr-log", stderr: "" });
+
+    try {
+        const result = await kubectl.logs("api-1", { previous: true });
+        assert.equal(result.current, "curr-log");
+        assert.equal(result.previous, "");
+    } finally {
+        shell.exec = original;
+    }
+
+});
+
+test("kubectl.events / podEvents / deploymentEvents arman los field selectors", async () => {
+
+    const capture = captureExec();
+
+    await kubectl.events({ namespace: "prod" });
+    await kubectl.podEvents("api-1", { namespace: "prod", warningsOnly: true });
+    await kubectl.deploymentEvents("api", { namespace: "prod" });
+
+    capture.restore();
+
+    assert.deepEqual(capture.calls[0], ["kubectl", "get", "events", "--sort-by=.lastTimestamp", "-n", "prod"]);
+    assert.deepEqual(capture.calls[1], [
+        "kubectl", "get", "events", "--sort-by=.lastTimestamp",
+        "--field-selector", "involvedObject.kind=Pod,involvedObject.name=api-1,type=Warning", "-n", "prod"
+    ]);
+    assert.deepEqual(capture.calls[2], [
+        "kubectl", "get", "events", "--sort-by=.lastTimestamp",
+        "--field-selector", "involvedObject.kind=Deployment,involvedObject.name=api", "-n", "prod"
+    ]);
+
+});
+
+test("kubectl.waitForDeployment con printEvents imprime eventos del deployment y sus pods al fallar", async () => {
+
+    const original = shell.exec.bind(shell);
+    const calls = [];
+
+    const deploymentJSON = {
+        spec: { replicas: 1, selector: { matchLabels: { app: "api" } } },
+        status: { readyReplicas: 0, updatedReplicas: 0, conditions: [] }
+    };
+
+    shell.exec = (...args) => {
+        calls.push(args);
+        if (args.includes("deployment/api")) return Promise.resolve({ code: 0, stdout: JSON.stringify(deploymentJSON), stderr: "" });
+        if (args.includes("pods")) return Promise.resolve({ code: 0, stdout: JSON.stringify({ items: [{ metadata: { name: "api-1" } }, { metadata: { name: "api-2" } }] }), stderr: "" });
+        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    };
+
+    try {
+        await assert.rejects(
+            kubectl.waitForDeployment({ deployment: "api", timeout: 30, pollInterval: 10, printEvents: true }),
+            err => err.name === "DeploymentRolloutError" && err.status === "timeout"
+        );
+
+        const selectors = calls
+            .filter(args => args.includes("events"))
+            .map(args => args[args.indexOf("--field-selector") + 1]);
+
+        assert.deepEqual(selectors, [
+            "involvedObject.kind=Deployment,involvedObject.name=api",
+            "involvedObject.kind=Pod,involvedObject.name=api-1",
+            "involvedObject.kind=Pod,involvedObject.name=api-2"
+        ]);
+    } finally {
+        shell.exec = original;
+    }
+
+});
+
+test("kubectl.waitForDeployment sin printEvents no consulta eventos", async () => {
+
+    const original = shell.exec.bind(shell);
+    const calls = [];
+
+    shell.exec = (...args) => {
+        calls.push(args);
+        return Promise.resolve({ code: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 0 } }), stderr: "" });
+    };
+
+    try {
+        await assert.rejects(kubectl.waitForDeployment({ deployment: "api", timeout: 30, pollInterval: 10 }));
+        assert.equal(calls.filter(args => args.includes("events")).length, 0);
+    } finally {
+        shell.exec = original;
+    }
+
+});

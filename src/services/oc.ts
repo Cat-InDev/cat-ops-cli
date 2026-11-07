@@ -1,4 +1,5 @@
 import { shell } from "./shell";
+import { logger } from "../core/logger";
 import type { ExecOptions, ExecResult } from "../core/types";
 
 // ---------------------------------------------------------------------------
@@ -134,8 +135,120 @@ export function startBuild(buildConfig: string, { follow = true, ...options }: O
 
 }
 
-export function logs(pod: string, options: OcOptions = {}): Promise<ExecResult> {
-    return shell.exec("oc", ...toExecArgs(["logs", pod], options));
+export interface OcLogsOptions extends OcOptions {
+    /** Contenedor del pod (-c). Necesario si el pod tiene varios contenedores. */
+    container?: string;
+    /** Trae (e imprime) el log del contenedor actual. Default: true. */
+    current?: boolean;
+    /**
+     * Trae (e imprime) también el log del contenedor anterior (--previous),
+     * útil tras un CrashLoopBackOff. Si no existe un contenedor anterior, se
+     * retorna vacío en vez de fallar. Default: false.
+     */
+    previous?: boolean;
+    /** Solo las últimas N líneas (--tail). */
+    tail?: number;
+}
+
+export interface OcLogsResult extends ExecResult {
+    /** Log del contenedor actual ("" si `current: false`). */
+    current: string;
+    /** Log del contenedor anterior ("" si no se pidió o no existe). */
+    previous: string;
+}
+
+function isPreviousLogNotFound(error: unknown): boolean {
+    const stderr = (error as Partial<ExecResult>)?.stderr ?? "";
+    return /previous terminated container|not found/i.test(stderr);
+}
+
+/**
+ * `oc logs <pod>`. Por defecto se comporta igual que antes (solo el log
+ * actual, en `stdout`/`current`). Con `previous: true` también trae el log
+ * del contenedor anterior:
+ *   const { current, previous } = await oc.logs("api-7d9f", { previous: true, namespace: "prod" });
+ */
+export async function logs(pod: string, { container, current = true, previous = false, tail, ...options }: OcLogsOptions = {}): Promise<OcLogsResult> {
+
+    const args = ["logs", pod];
+
+    if (container) {
+        args.push("-c", container);
+    }
+
+    if (tail !== undefined) {
+        args.push("--tail", String(tail));
+    }
+
+    let base: ExecResult = { code: 0, stdout: "", stderr: "" };
+    let currentLog = "";
+    let previousLog = "";
+
+    if (current) {
+        base = await shell.exec("oc", ...toExecArgs(args, options));
+        currentLog = base.stdout;
+    }
+
+    if (previous) {
+
+        logger.info(`Log anterior (--previous) de "${pod}"`);
+
+        try {
+            const result = await shell.exec("oc", ...toExecArgs([...args, "--previous"], options));
+            previousLog = result.stdout;
+            if (!current) base = result;
+        } catch (error) {
+            if (!isPreviousLogNotFound(error)) throw error;
+            logger.info(`"${pod}" no tiene un contenedor anterior, log anterior vacío`);
+        }
+
+    }
+
+    return { ...base, current: currentLog, previous: previousLog };
+
+}
+
+// ---------------------------------------------------------------------------
+// Eventos — de namespace, de un pod individual o de un deployment
+// ---------------------------------------------------------------------------
+
+export interface OcEventsOptions extends OcOptions {
+    /** Solo eventos de tipo Warning. Default: false. */
+    warningsOnly?: boolean;
+}
+
+function eventsArgs(fieldSelectors: string[], warningsOnly: boolean): string[] {
+
+    const selectors = warningsOnly ? [...fieldSelectors, "type=Warning"] : fieldSelectors;
+    const args = ["events", "--sort-by=.lastTimestamp"];
+
+    if (selectors.length) {
+        args.push("--field-selector", selectors.join(","));
+    }
+
+    return args;
+
+}
+
+/** Eventos de todo el namespace (el de `namespace`, o el actual), ordenados por fecha. */
+export function events({ warningsOnly = false, ...options }: OcEventsOptions = {}): Promise<ExecResult> {
+    return get(...eventsArgs([], warningsOnly), options);
+}
+
+/** Eventos de un pod individual. */
+export function podEvents(pod: string, { warningsOnly = false, ...options }: OcEventsOptions = {}): Promise<ExecResult> {
+    return get(...eventsArgs(["involvedObject.kind=Pod", `involvedObject.name=${pod}`], warningsOnly), options);
+}
+
+export interface OcDeploymentEventsOptions extends OcEventsOptions {
+    /** "deployment" (k8s nativo, default) o "dc" (DeploymentConfig clásico de OpenShift). */
+    resourceType?: "deployment" | "dc";
+}
+
+/** Eventos de un Deployment/DeploymentConfig (escalados, fallos de rollout, etc.). */
+export function deploymentEvents(deployment: string, { resourceType = "deployment", warningsOnly = false, ...options }: OcDeploymentEventsOptions = {}): Promise<ExecResult> {
+    const kind = resourceType === "dc" ? "DeploymentConfig" : "Deployment";
+    return get(...eventsArgs([`involvedObject.kind=${kind}`, `involvedObject.name=${deployment}`], warningsOnly), options);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +334,19 @@ export interface WaitForDeploymentOptions extends OcOptions {
      * antes de abortar inmediatamente. Si no se pasa, no se valida.
      */
     maxRestarts?: number;
+    /**
+     * Si el rollout falla (timeout, Failed o maxRestarts), imprime los eventos
+     * para saber qué está fallando: `true` = deployment y pods, o elegir con
+     * `{ deployment: true, pods: true }`. Default: no imprime.
+     */
+    printEvents?: boolean | PrintEventsOptions;
+}
+
+export interface PrintEventsOptions {
+    /** Eventos del deployment en sí. */
+    deployment?: boolean;
+    /** Eventos de cada pod del deployment (ImagePullBackOff, FailedScheduling, probes, etc.). */
+    pods?: boolean;
 }
 
 type SelectorLike = { matchLabels?: Record<string, string> } | Record<string, string> | undefined;
@@ -276,6 +402,80 @@ function isProgressingFailed(conditions: OcConditionJSON[]): boolean {
 
 }
 
+async function listPodNames(matchLabels: Record<string, string> | undefined, options: OcOptions): Promise<string[]> {
+
+    if (!matchLabels || !Object.keys(matchLabels).length) {
+        return [];
+    }
+
+    const selector = Object.entries(matchLabels)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(",");
+
+    const result = await get("pods", "-l", selector, "-o", "json", options);
+
+    const parsed = JSON.parse(result.stdout) as {
+        items?: Array<{ metadata?: { name?: string } }>;
+    };
+
+    return (parsed.items ?? [])
+        .map(item => item.metadata?.name)
+        .filter((name): name is string => Boolean(name));
+
+}
+
+/**
+ * Imprime los eventos del deployment y/o de sus pods antes de reportar el
+ * fallo. Nunca lanza: si no se pueden leer los eventos solo se avisa, para
+ * no tapar el error original del rollout.
+ */
+async function printFailureEvents(
+    deployment: string,
+    resourceType: "deployment" | "dc",
+    matchLabels: Record<string, string> | undefined,
+    printEvents: boolean | PrintEventsOptions,
+    options: OcOptions
+): Promise<void> {
+
+    const printDeployment = printEvents === true || (typeof printEvents === "object" && Boolean(printEvents.deployment));
+    const printPods = printEvents === true || (typeof printEvents === "object" && Boolean(printEvents.pods));
+
+    if (printDeployment) {
+        try {
+            logger.warn(`Eventos de ${resourceType}/${deployment}:`);
+            await deploymentEvents(deployment, { resourceType, ...options });
+        } catch (error) {
+            logger.warn(`No se pudieron obtener los eventos de "${deployment}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+        }
+    }
+
+    if (!printPods) return;
+
+    let pods: string[];
+
+    try {
+        pods = await listPodNames(matchLabels, options);
+    } catch (error) {
+        logger.warn(`No se pudieron listar los pods de "${deployment}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+        return;
+    }
+
+    if (!pods.length) {
+        logger.warn(`No se encontraron pods de "${deployment}" para mostrar eventos`);
+        return;
+    }
+
+    for (const pod of pods) {
+        try {
+            logger.warn(`Eventos del pod ${pod}:`);
+            await podEvents(pod, options);
+        } catch (error) {
+            logger.warn(`No se pudieron obtener los eventos del pod "${pod}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+        }
+    }
+
+}
+
 /**
  * Valida cíclicamente el estado de un Deployment/DeploymentConfig hasta que:
  *   - llega a estado exitoso (replicas listas/actualizadas == replicas deseadas) -> resuelve,
@@ -296,11 +496,21 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
         pollInterval = 5_000,
         failedGracePeriod = pollInterval * 6,
         maxRestarts,
+        printEvents = false,
         ...ocOptions
     } = options;
 
     const startedAt = Date.now();
     let failedSince: number | null = null;
+    let matchLabels: Record<string, string> | undefined;
+
+    // Imprime los eventos (si se pidió) y arma el error a lanzar.
+    const fail = async (message: string, info: Omit<DeploymentWatchResult, "message">): Promise<DeploymentRolloutError> => {
+        if (printEvents) {
+            await printFailureEvents(deployment, resourceType, matchLabels, printEvents, ocOptions);
+        }
+        return new DeploymentRolloutError(message, info);
+    };
 
     while (true) {
 
@@ -308,7 +518,7 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
 
         if (elapsedMs >= timeout) {
             const message = `Timeout esperando el rollout de "${deployment}" (${timeout}ms)`;
-            throw new DeploymentRolloutError(message, { status: "timeout", deployment, elapsedMs, restarts: -1 });
+            throw await fail(message, { status: "timeout", deployment, elapsedMs, restarts: -1 });
         }
 
         let json: OcWorkloadJSON;
@@ -321,6 +531,8 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
             continue;
         }
 
+        matchLabels = matchLabelsOf(json.spec?.selector);
+
         const desired = json.spec?.replicas ?? 1;
         const ready = json.status?.readyReplicas ?? json.status?.availableReplicas ?? 0;
         const updated = json.status?.updatedReplicas ?? 0;
@@ -332,11 +544,11 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
 
         if (maxRestarts !== undefined) {
 
-            restarts = await countPodRestarts(matchLabelsOf(json.spec?.selector), ocOptions);
+            restarts = await countPodRestarts(matchLabels, ocOptions);
 
             if (restarts > maxRestarts) {
                 const message = `"${deployment}" superó el máximo de reinicios permitido (${restarts} > ${maxRestarts})`;
-                throw new DeploymentRolloutError(message, { status: "failed", deployment, elapsedMs, restarts });
+                throw await fail(message, { status: "failed", deployment, elapsedMs, restarts });
             }
 
         }
@@ -352,7 +564,7 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
                 failedSince = Date.now();
             } else if (Date.now() - failedSince >= failedGracePeriod) {
                 const message = `"${deployment}" quedó en estado Failed y no se recuperó en ${failedGracePeriod}ms`;
-                throw new DeploymentRolloutError(message, { status: "failed", deployment, elapsedMs, restarts });
+                throw await fail(message, { status: "failed", deployment, elapsedMs, restarts });
             }
 
         } else {
@@ -429,6 +641,8 @@ export interface WaitForDeploymentGroupOptions extends OcOptions {
     failedGracePeriod?: number;
     /** Igual que en waitForDeployment, aplicado a cada instancia del grupo. */
     maxRestarts?: number;
+    /** Igual que en waitForDeployment, aplicado a cada instancia del grupo que falle. */
+    printEvents?: boolean | PrintEventsOptions;
 }
 
 function toSelectorString(label: string | Record<string, string>): string {
@@ -479,6 +693,7 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
         pollInterval = 5_000,
         failedGracePeriod = pollInterval * 6,
         maxRestarts,
+        printEvents,
         ...ocOptions
     } = options;
 
@@ -507,6 +722,7 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
             pollInterval,
             failedGracePeriod,
             maxRestarts,
+            printEvents,
             ...ocOptions
         }))
     );

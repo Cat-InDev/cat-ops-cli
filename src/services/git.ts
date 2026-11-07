@@ -1,5 +1,6 @@
+import * as path from "path";
 import { shell, withExecOptions } from "./shell";
-import type { ExecOptions, ExecResult } from "../core/types";
+import type { ExecOptions, ExecResult, ShellRunner } from "../core/types";
 
 // ---------------------------------------------------------------------------
 // Base común: toda función de git acepta exec (retry/timeout/dryRun) ya sea
@@ -10,11 +11,15 @@ import type { ExecOptions, ExecResult } from "../core/types";
 export interface GitCommon {
     /** retry/timeout/dryRun para esta llamada puntual (ver shell.exec). */
     exec?: ExecOptions;
-    /** Directorio del repo (debe contener `.git`). Se ejecuta git con `-C <dir>`. */
-    dir?: string;
+    /** Directorio de trabajo para esta llamada (equivale a un `cd` antes del comando). */
+    cwd?: string;
+    /** Shell compartido (con su propio `cd`/env) en el que ejecutar este comando. */
+    runner?: ShellRunner;
 }
 
-const EXEC_KEYS: ReadonlyArray<keyof ExecOptions> = ["retry", "retryDelay", "timeout", "dryRun", "shell", "env"];
+const EXEC_KEYS: ReadonlyArray<keyof ExecOptions> = [
+    "retry", "retryDelay", "timeout", "dryRun", "shell", "env", "cwd", "runner"
+];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -43,7 +48,12 @@ function toExec(value: GitCommon | ExecOptions | undefined): ExecOptions | undef
     if (isBareExec(value)) {
         return Object.keys(value).length ? value : undefined;
     }
-    return value.exec;
+    const source = value as GitCommon & ExecOptions;
+    const exec: ExecOptions = {};
+    if (source.cwd !== undefined) exec.cwd = source.cwd;
+    if (source.runner !== undefined) exec.runner = source.runner;
+    if (source.exec) Object.assign(exec, source.exec);
+    return Object.keys(exec).length ? exec : undefined;
 }
 
 /** Normaliza el último argumento: objeto de opciones o ExecOptions plano. */
@@ -51,16 +61,11 @@ function lastOptions<T extends GitCommon>(opts?: T | ExecOptions): { options: T;
     if (opts === undefined || isBareExec(opts)) {
         return { options: {} as T, exec: toExec(opts) };
     }
-    return { options: opts as T, exec: opts.exec };
+    return { options: opts as T, exec: toExec(opts) };
 }
 
 function toTargets(files: string[] | string): string[] {
     return Array.isArray(files) ? files : [files];
-}
-
-/** Ejecuta git en el directorio indicado (si hay), prefijando los args con `-C <dir>`. */
-function gitExec(args: string[], exec: ExecOptions | undefined, dir?: string): Promise<ExecResult> {
-    return shell.exec("git", ...withExecOptions(dir ? ["-C", dir, ...args] : args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +81,21 @@ export interface GitCloneOptions extends GitCommon {
     bare?: boolean;
     /** `--single-branch`: clona solo la rama indicada, sin las demás refs. */
     singleBranch?: boolean;
+    /**
+     * Clona DENTRO de `targetPath/<nombre-del-repo>` en lugar de pedir la
+     * carpeta destino libre: si `/home/holamundo` ya existe, queda como
+     * `/home/holamundo/repo1`. El nombre se deriva de la URL (último segmento,
+     * sin `.git`).
+     */
+    append?: boolean;
+    /** Si la carpeta destino ya existe, se elimina antes de clonar. Aplica tanto al path indicado como al subdirectorio de `append`. */
+    overwrite?: boolean;
+}
+
+/** Nombre del repo a partir de la URL (último segmento, sin `.git`). */
+function repoNameFromUrl(url: string): string {
+    const cleaned = url.replace(/[\\/]+$/, "");
+    return cleaned.replace(/^.*[:/]/, "").replace(/\.git$/i, "");
 }
 
 export function clone(url: string, targetPath: string, opts: GitCloneOptions | ExecOptions = {}): Promise<ExecResult> {
@@ -85,8 +105,10 @@ export function clone(url: string, targetPath: string, opts: GitCloneOptions | E
     if (options.depth !== undefined) args.push("--depth", String(options.depth));
     if (options.bare) args.push("--bare");
     if (options.singleBranch) args.push("--single-branch");
-    args.push(url, targetPath);
-    return gitExec(args, exec, options.dir);
+    const target = options.append ? path.join(targetPath, repoNameFromUrl(url)) : targetPath;
+    args.push(url, target);
+    const runClone = () => shell.exec("git", ...withExecOptions(args, exec));
+    return options.overwrite ? shell.remove(target).then(runClone) : runClone();
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +137,7 @@ export function checkout(branch: string, opts: GitCheckoutOptions | ExecOptions 
     if (options.force) args.push("-f");
     if (options.detach) args.push("--detach");
     if (options.startPoint) args.push(options.startPoint);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitBranchOptions extends GitCommon {
@@ -148,7 +170,7 @@ export function branch(opts: GitBranchOptions | ExecOptions = {}): Promise<ExecR
         args.push(options.create);
         if (options.startPoint) args.push(options.startPoint);
     }
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // --- Manejo de ramas: helpers dedicados ------------------------------------
@@ -171,8 +193,8 @@ export function branchCreate(name: string, opts: GitBranchCreateOptions | ExecOp
     if (options.track) args.push("--track");
     args.push(name);
     if (options.startPoint) args.push(options.startPoint);
-    return gitExec(args, exec, options.dir)
-        .then((res) => (options.checkout ? checkout(name, { exec, dir: options.dir }) : res));
+    return shell.exec("git", ...withExecOptions(args, exec))
+        .then((res) => (options.checkout ? checkout(name, exec) : res));
 }
 
 export interface GitBranchDeleteOptions extends GitCommon {
@@ -183,7 +205,7 @@ export interface GitBranchDeleteOptions extends GitCommon {
 export function branchDelete(name: string, opts: GitBranchDeleteOptions | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitBranchDeleteOptions>(opts);
     const args = ["branch", options.force ? "-D" : "-d", name];
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitBranchRenameOptions extends GitCommon {
@@ -198,7 +220,7 @@ export function branchRename(newName: string, opts: GitBranchRenameOptions | Exe
     const args = ["branch", options.force ? "-M" : "-m"];
     if (options.oldName) args.push(options.oldName);
     args.push(newName);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitBranchListOptions extends GitCommon {
@@ -237,12 +259,12 @@ export function branchList(opts: GitBranchListOptions | ExecOptions = {}): Promi
     if (options.contains) args.push("--contains", options.contains);
     if (options.sort) args.push(`--sort=${options.sort}`);
     if (options.pattern) args.push(options.pattern);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export function branchShowCurrent(opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["branch", "--show-current"], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["branch", "--show-current"], exec));
 }
 
 export interface GitBranchUpstreamOptions extends GitCommon {
@@ -256,14 +278,14 @@ export function branchSetUpstream(opts: GitBranchUpstreamOptions | ExecOptions =
     const { options, exec } = lastOptions<GitBranchUpstreamOptions>(opts);
     const args = ["branch", "-u", options.upstream];
     if (options.name) args.push(options.name);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export function branchUnsetUpstream(name?: string, opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
     const args = ["branch", "--unset-upstream"];
     if (name) args.push(name);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +322,7 @@ export function pull(opts: GitPullOptions | ExecOptions = {}): Promise<ExecResul
     if (options.noFF) args.push("--no-ff");
     if (options.prune) args.push("--prune");
     if (options.tags) args.push("--tags");
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitFetchOptions extends GitCommon {
@@ -333,7 +355,7 @@ export function fetch(opts: GitFetchOptions | ExecOptions = {}): Promise<ExecRes
     } else if (options.all !== false) {
         args.push("--all");
     }
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +378,7 @@ export function add(files: string[] | string, opts: GitAddOptions | ExecOptions 
     if (options.update) args.push("-u");
     if (options.force) args.push("-f");
     args.push(...toTargets(files));
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitCommitOptions extends GitCommon {
@@ -384,14 +406,14 @@ export async function commit(message: string, ...rest: Array<string[] | string |
     const exec = toExec(options);
     const targets = [...files, ...toTargets(options.files ?? [])];
     if (targets.length > 0) {
-        await add(targets, { exec, dir: options.dir });
+        await add(targets, exec);
     }
     const args = ["commit"];
     if (options.all) args.push("-a");
     if (options.allowEmpty) args.push("--allow-empty");
     if (options.amend) args.push("--amend");
     args.push("-m", `'${message}'`);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitPushOptions extends GitCommon {
@@ -422,7 +444,7 @@ export function push(...rawArgs: Array<string | GitPushOptions>): Promise<ExecRe
     if (options.force) args.push("--force");
     else if (options.forceWithLease) args.push("--force-with-lease");
     if (options.setUpstream) args.push("-u");
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -445,12 +467,12 @@ export function tag(name: string, opts: GitTagOptions | ExecOptions = {}): Promi
     if (options.force) args.push("-f");
     args.push(name);
     if (options.message) args.push("-m", options.message);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export function tagDelete(name: string, opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["tag", "-d", name], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["tag", "-d", name], exec));
 }
 
 export interface GitTagListOptions extends GitCommon {
@@ -465,7 +487,7 @@ export function tagList(opts: GitTagListOptions | ExecOptions = {}): Promise<Exe
     const args = ["tag", "--list"];
     if (options.sort) args.push(`--sort=${options.sort}`);
     if (options.pattern) args.push(options.pattern);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +521,7 @@ export function merge(...rawArgs: Array<string | GitMergeOptions>): Promise<Exec
         if (options.message) args.push("-m", options.message);
         if (branch) args.push(branch);
     }
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitRebaseOptions extends GitCommon {
@@ -526,7 +548,7 @@ export function rebase(opts: GitRebaseOptions | ExecOptions = {}): Promise<ExecR
     if (options.skip) args.push("--skip");
     if (options.onto) args.push("--onto", options.onto);
     if (options.branch) args.push(options.branch);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +573,7 @@ export function status(opts: GitStatusOptions | ExecOptions = {}): Promise<ExecR
     if (options.branch) args.push("-b");
     if (options.porcelain) args.push("--porcelain");
     if (options.untrackedFiles !== undefined) args.push(`--untracked-files=${options.untrackedFiles}`);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitLogOptions extends GitCommon {
@@ -587,7 +609,7 @@ export function log(opts: GitLogOptions | ExecOptions = {}): Promise<ExecResult>
     if (options.allBranches) args.push("--all");
     if (options.format) args.push(`--pretty=format:${options.format}`);
     if (options.branch) args.push(options.branch);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitDiffOptions extends GitCommon {
@@ -608,7 +630,7 @@ export function diff(opts: GitDiffOptions | ExecOptions = {}): Promise<ExecResul
     if (options.stat) args.push("--stat");
     if (options.nameOnly) args.push("--name-only");
     args.push(...toTargets(options.files ?? []));
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitShowOptions extends GitCommon {
@@ -624,7 +646,7 @@ export function show(ref: string, opts: GitShowOptions | ExecOptions = {}): Prom
     if (options.stat) args.push("--stat");
     if (options.nameOnly) args.push("--name-only");
     args.push(ref);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -646,22 +668,22 @@ export function remote(opts: GitRemoteOptions | ExecOptions = {}): Promise<ExecR
     if (options.verbose) args.push("-v");
     if (options.show) args.push("show", options.show);
     else if (options.getUrl) args.push("get-url", options.getUrl);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export function remoteAdd(name: string, url: string, opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["remote", "add", name, url], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["remote", "add", name, url], exec));
 }
 
 export function remoteRemove(name: string, opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["remote", "remove", name], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["remote", "remove", name], exec));
 }
 
 export function remoteSetUrl(name: string, url: string, opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["remote", "set-url", name, url], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["remote", "set-url", name, url], exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +708,7 @@ export function stashPush(opts: GitStashOptions | ExecOptions = {}): Promise<Exe
     if (options.keepIndex) args.push("-k");
     if (options.includeUntracked) args.push("-u");
     if (options.message) args.push("-m", options.message);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitStashIndexOptions extends GitCommon {
@@ -698,26 +720,26 @@ export function stashPop(opts: GitStashIndexOptions | ExecOptions = {}): Promise
     const { options, exec } = lastOptions<GitStashIndexOptions>(opts);
     const args = ["stash", "pop"];
     if (options.index !== undefined) args.push(`stash@{${options.index}}`);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export function stashApply(opts: GitStashIndexOptions | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitStashIndexOptions>(opts);
     const args = ["stash", "apply"];
     if (options.index !== undefined) args.push(`stash@{${options.index}}`);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export function stashList(opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["stash", "list"], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["stash", "list"], exec));
 }
 
 export function stashDrop(opts: GitStashIndexOptions | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitStashIndexOptions>(opts);
     const args = ["stash", "drop"];
     if (options.index !== undefined) args.push(`stash@{${options.index}}`);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +758,7 @@ export function reset(opts: GitResetOptions | ExecOptions = {}): Promise<ExecRes
     const args = ["reset"];
     if (options.mode) args.push(`--${options.mode}`);
     if (options.commit) args.push(options.commit);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export interface GitInitOptions extends GitCommon {
@@ -751,22 +773,22 @@ export function init(opts: GitInitOptions | ExecOptions = {}): Promise<ExecResul
     const args = ["init"];
     if (options.bare) args.push("--bare");
     if (options.initialBranch) args.push("-b", options.initialBranch);
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }
 
 export function configGet(name: string, opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["config", "--get", name], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["config", "--get", name], exec));
 }
 
 export function configSet(name: string, value: string, opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["config", name, value], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["config", name, value], exec));
 }
 
 export function configList(opts: GitCommon | ExecOptions = {}): Promise<ExecResult> {
     const { options, exec } = lastOptions<GitCommon>(opts);
-    return gitExec(["config", "--list"], exec, options.dir);
+    return shell.exec("git", ...withExecOptions(["config", "--list"], exec));
 }
 
 export interface GitRevParseOptions extends GitCommon {
@@ -792,5 +814,5 @@ export function revParse(...rawArgs: Array<string | GitRevParseOptions>): Promis
     if (options.abbrevRef) args.push("--abbrev-ref");
     if (options.showTopLevel) args.push("--show-toplevel");
     args.push(options.ref ?? positional[0] ?? "HEAD");
-    return gitExec(args, exec, options.dir);
+    return shell.exec("git", ...withExecOptions(args, exec));
 }

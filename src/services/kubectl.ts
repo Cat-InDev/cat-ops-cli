@@ -1,4 +1,5 @@
 import { shell } from "./shell";
+import { logger } from "../core/logger";
 import type { ExecOptions, ExecResult } from "../core/types";
 
 // ---------------------------------------------------------------------------
@@ -76,8 +77,114 @@ export function get(...rawArgs: Array<string | KubectlOptions>): Promise<ExecRes
 
 }
 
-export function logs(pod: string, options: KubectlOptions = {}): Promise<ExecResult> {
-    return shell.exec("kubectl", ...toExecArgs(["logs", pod], options));
+export interface KubectlLogsOptions extends KubectlOptions {
+    /** Contenedor del pod (-c). Necesario si el pod tiene varios contenedores. */
+    container?: string;
+    /** Trae (e imprime) el log del contenedor actual. Default: true. */
+    current?: boolean;
+    /**
+     * Trae (e imprime) también el log del contenedor anterior (--previous),
+     * útil tras un CrashLoopBackOff. Si no existe un contenedor anterior, se
+     * retorna vacío en vez de fallar. Default: false.
+     */
+    previous?: boolean;
+    /** Solo las últimas N líneas (--tail). */
+    tail?: number;
+}
+
+export interface KubectlLogsResult extends ExecResult {
+    /** Log del contenedor actual ("" si `current: false`). */
+    current: string;
+    /** Log del contenedor anterior ("" si no se pidió o no existe). */
+    previous: string;
+}
+
+function isPreviousLogNotFound(error: unknown): boolean {
+    const stderr = (error as Partial<ExecResult>)?.stderr ?? "";
+    return /previous terminated container|not found/i.test(stderr);
+}
+
+/**
+ * `kubectl logs <pod>`. Por defecto se comporta igual que antes (solo el log
+ * actual, en `stdout`/`current`). Con `previous: true` también trae el log
+ * del contenedor anterior:
+ *   const { current, previous } = await kubectl.logs("api-7d9f", { previous: true, namespace: "prod" });
+ */
+export async function logs(pod: string, { container, current = true, previous = false, tail, ...options }: KubectlLogsOptions = {}): Promise<KubectlLogsResult> {
+
+    const args = ["logs", pod];
+
+    if (container) {
+        args.push("-c", container);
+    }
+
+    if (tail !== undefined) {
+        args.push("--tail", String(tail));
+    }
+
+    let base: ExecResult = { code: 0, stdout: "", stderr: "" };
+    let currentLog = "";
+    let previousLog = "";
+
+    if (current) {
+        base = await shell.exec("kubectl", ...toExecArgs(args, options));
+        currentLog = base.stdout;
+    }
+
+    if (previous) {
+
+        logger.info(`Log anterior (--previous) de "${pod}"`);
+
+        try {
+            const result = await shell.exec("kubectl", ...toExecArgs([...args, "--previous"], options));
+            previousLog = result.stdout;
+            if (!current) base = result;
+        } catch (error) {
+            if (!isPreviousLogNotFound(error)) throw error;
+            logger.info(`"${pod}" no tiene un contenedor anterior, log anterior vacío`);
+        }
+
+    }
+
+    return { ...base, current: currentLog, previous: previousLog };
+
+}
+
+// ---------------------------------------------------------------------------
+// Eventos — de namespace, de un pod individual o de un deployment
+// ---------------------------------------------------------------------------
+
+export interface KubectlEventsOptions extends KubectlOptions {
+    /** Solo eventos de tipo Warning. Default: false. */
+    warningsOnly?: boolean;
+}
+
+function eventsArgs(fieldSelectors: string[], warningsOnly: boolean): string[] {
+
+    const selectors = warningsOnly ? [...fieldSelectors, "type=Warning"] : fieldSelectors;
+    const args = ["events", "--sort-by=.lastTimestamp"];
+
+    if (selectors.length) {
+        args.push("--field-selector", selectors.join(","));
+    }
+
+    return args;
+
+}
+
+/** Eventos de todo el namespace (el de `namespace`, o el actual), ordenados por fecha. */
+export function events({ warningsOnly = false, ...options }: KubectlEventsOptions = {}): Promise<ExecResult> {
+    return get(...eventsArgs([], warningsOnly), options);
+}
+
+/** Eventos de un pod individual. */
+export function podEvents(pod: string, { warningsOnly = false, ...options }: KubectlEventsOptions = {}): Promise<ExecResult> {
+    return get(...eventsArgs(["involvedObject.kind=Pod", `involvedObject.name=${pod}`], warningsOnly), options);
+}
+
+/** Eventos de un Deployment (escalados, fallos de rollout, etc.). */
+export function deploymentEvents(deployment: string, { warningsOnly = false, ...options }: KubectlEventsOptions = {}): Promise<ExecResult> {
+    return get(...eventsArgs(["involvedObject.kind=Deployment", `involvedObject.name=${deployment}`], warningsOnly), options);
 }
 
 export function rolloutStatus(deployment: string, options: KubectlOptions = {}): Promise<ExecResult> {
@@ -174,6 +281,19 @@ export interface WaitForDeploymentOptions extends KubectlOptions {
      * el `failedGracePeriod` ni el `timeout`. Si no se pasa, no se valida.
      */
     maxRestarts?: number;
+    /**
+     * Si el rollout falla (timeout, Failed o maxRestarts), imprime los eventos
+     * para saber qué está fallando: `true` = deployment y pods, o elegir con
+     * `{ deployment: true, pods: true }`. Default: no imprime.
+     */
+    printEvents?: boolean | PrintEventsOptions;
+}
+
+export interface PrintEventsOptions {
+    /** Eventos del deployment en sí. */
+    deployment?: boolean;
+    /** Eventos de cada pod del deployment (ImagePullBackOff, FailedScheduling, probes, etc.). */
+    pods?: boolean;
 }
 
 async function readDeploymentJSON(name: string, options: KubectlOptions): Promise<DeploymentJSON> {
@@ -215,6 +335,79 @@ function isProgressingFailed(conditions: DeploymentConditionJSON[]): boolean {
 
 }
 
+async function listPodNames(matchLabels: Record<string, string> | undefined, options: KubectlOptions): Promise<string[]> {
+
+    if (!matchLabels || !Object.keys(matchLabels).length) {
+        return [];
+    }
+
+    const selector = Object.entries(matchLabels)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(",");
+
+    const result = await get("pods", "-l", selector, "-o", "json", options);
+
+    const parsed = JSON.parse(result.stdout) as {
+        items?: Array<{ metadata?: { name?: string } }>;
+    };
+
+    return (parsed.items ?? [])
+        .map(item => item.metadata?.name)
+        .filter((name): name is string => Boolean(name));
+
+}
+
+/**
+ * Imprime los eventos del deployment y/o de sus pods antes de reportar el
+ * fallo. Nunca lanza: si no se pueden leer los eventos solo se avisa, para
+ * no tapar el error original del rollout.
+ */
+async function printFailureEvents(
+    deployment: string,
+    matchLabels: Record<string, string> | undefined,
+    printEvents: boolean | PrintEventsOptions,
+    options: KubectlOptions
+): Promise<void> {
+
+    const printDeployment = printEvents === true || (typeof printEvents === "object" && Boolean(printEvents.deployment));
+    const printPods = printEvents === true || (typeof printEvents === "object" && Boolean(printEvents.pods));
+
+    if (printDeployment) {
+        try {
+            logger.warn(`Eventos de deployment/${deployment}:`);
+            await deploymentEvents(deployment, options);
+        } catch (error) {
+            logger.warn(`No se pudieron obtener los eventos de "${deployment}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+        }
+    }
+
+    if (!printPods) return;
+
+    let pods: string[];
+
+    try {
+        pods = await listPodNames(matchLabels, options);
+    } catch (error) {
+        logger.warn(`No se pudieron listar los pods de "${deployment}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+        return;
+    }
+
+    if (!pods.length) {
+        logger.warn(`No se encontraron pods de "${deployment}" para mostrar eventos`);
+        return;
+    }
+
+    for (const pod of pods) {
+        try {
+            logger.warn(`Eventos del pod ${pod}:`);
+            await podEvents(pod, options);
+        } catch (error) {
+            logger.warn(`No se pudieron obtener los eventos del pod "${pod}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+        }
+    }
+
+}
+
 /**
  * Valida cíclicamente el estado de un Deployment hasta que:
  *   - llega a estado exitoso (replicas listas/actualizadas == replicas deseadas) -> resuelve,
@@ -234,11 +427,21 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
         pollInterval = 5_000,
         failedGracePeriod = pollInterval * 6,
         maxRestarts,
+        printEvents = false,
         ...kubectlOptions
     } = options;
 
     const startedAt = Date.now();
     let failedSince: number | null = null;
+    let matchLabels: Record<string, string> | undefined;
+
+    // Imprime los eventos (si se pidió) y arma el error a lanzar.
+    const fail = async (message: string, info: Omit<DeploymentWatchResult, "message">): Promise<DeploymentRolloutError> => {
+        if (printEvents) {
+            await printFailureEvents(deployment, matchLabels, printEvents, kubectlOptions);
+        }
+        return new DeploymentRolloutError(message, info);
+    };
 
     while (true) {
 
@@ -246,7 +449,7 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
 
         if (elapsedMs >= timeout) {
             const message = `Timeout esperando el rollout de "${deployment}" (${timeout}ms)`;
-            throw new DeploymentRolloutError(message, { status: "timeout", deployment, elapsedMs, restarts: -1 });
+            throw await fail(message, { status: "timeout", deployment, elapsedMs, restarts: -1 });
         }
 
         let json: DeploymentJSON;
@@ -259,6 +462,8 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
             continue;
         }
 
+        matchLabels = json.spec?.selector?.matchLabels;
+
         const desired = json.spec?.replicas ?? 1;
         const ready = json.status?.readyReplicas ?? 0;
         const updated = json.status?.updatedReplicas ?? 0;
@@ -270,11 +475,11 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
 
         if (maxRestarts !== undefined) {
 
-            restarts = await countPodRestarts(json.spec?.selector?.matchLabels, kubectlOptions);
+            restarts = await countPodRestarts(matchLabels, kubectlOptions);
 
             if (restarts > maxRestarts) {
                 const message = `Deployment "${deployment}" superó el máximo de reinicios permitido (${restarts} > ${maxRestarts})`;
-                throw new DeploymentRolloutError(message, { status: "failed", deployment, elapsedMs, restarts });
+                throw await fail(message, { status: "failed", deployment, elapsedMs, restarts });
             }
 
         }
@@ -290,7 +495,7 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
                 failedSince = Date.now();
             } else if (Date.now() - failedSince >= failedGracePeriod) {
                 const message = `Deployment "${deployment}" quedó en estado Failed y no se recuperó en ${failedGracePeriod}ms`;
-                throw new DeploymentRolloutError(message, { status: "failed", deployment, elapsedMs, restarts });
+                throw await fail(message, { status: "failed", deployment, elapsedMs, restarts });
             }
 
         } else {
@@ -364,6 +569,8 @@ export interface WaitForDeploymentGroupOptions extends KubectlOptions {
     failedGracePeriod?: number;
     /** Igual que en waitForDeployment, aplicado a cada instancia del grupo. */
     maxRestarts?: number;
+    /** Igual que en waitForDeployment, aplicado a cada instancia del grupo que falle. */
+    printEvents?: boolean | PrintEventsOptions;
 }
 
 function toSelectorString(label: string | Record<string, string>): string {
@@ -411,6 +618,7 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
         pollInterval = 5_000,
         failedGracePeriod = pollInterval * 6,
         maxRestarts,
+        printEvents,
         ...kubectlOptions
     } = options;
 
@@ -438,6 +646,7 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
             pollInterval,
             failedGracePeriod,
             maxRestarts,
+            printEvents,
             ...kubectlOptions
         }))
     );
