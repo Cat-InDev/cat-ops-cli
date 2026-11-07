@@ -676,13 +676,19 @@ await ctx.run("deploy-api", async () => {
 });
 ```
 
-Con `printEvents`, antes de lanzar el error imprime los eventos para saber **qué** está fallando (ImagePullBackOff, FailedScheduling, probes, cuota, etc.). `true` imprime los del deployment y los de cada uno de sus pods; también se puede elegir: `{ deployment: true, pods: true }`. `waitForDeploymentGroup` acepta la misma opción para cada instancia que falle.
+El polling es silencioso: no imprime el comando ni el JSON en cada iteración. Si la validación termina con error (timeout, Failed o `maxRestarts`), se imprime **una sola vez, al final**, un diagnóstico con las condiciones del recurso (p. ej. `ReplicaFailure (FailedCreate): ... exceeded quota`) y, según los flags:
+
+- `printEvents`: `true` imprime los eventos del deployment y de sus pods; también se puede elegir con `{ deployment: true, pods: true }`. Los eventos del deployment **incluyen los de sus ReplicaSets** (o ReplicationControllers y deployer pods con `dc`), que es donde Kubernetes registra los `FailedCreate` por quota: esos pods nunca llegan a existir.
+- `printLogs`: `true` imprime el log actual y el anterior (`--previous`, vacío si no existe) de cada pod, con todos sus contenedores; también se puede elegir con `{ current, previous, tail }`.
+
+`waitForDeploymentGroup` acepta los mismos flags y, al final, imprime el diagnóstico de cada instancia que falló, de a una.
 
 ```javascript
 await ctx.services.oc.waitForDeployment({
     deployment: "api",
     namespace: "prod",
-    printEvents: { deployment: true, pods: true }
+    printEvents: true,                 // o { deployment: true, pods: true }
+    printLogs: { tail: 200 }           // actual + anterior, últimas 200 líneas
 });
 ```
 
@@ -698,14 +704,19 @@ await kubectl.logs("api-7d9f", { namespace: "prod" });
 // anterior, `previous` queda en "" en vez de fallar.
 const { current, previous } = await oc.logs("api-7d9f", { namespace: "prod", previous: true, container: "app", tail: 200 });
 
-// Solo el anterior
-await oc.logs("api-7d9f", { current: false, previous: true });
+// Solo el anterior, de todos los contenedores
+await oc.logs("api-7d9f", { current: false, previous: true, allContainers: true });
 
-// Eventos (ordenados por fecha; `warningsOnly: true` filtra solo Warning)
-await oc.events({ namespace: "prod" });                                // de todo el namespace
-await oc.podEvents("api-7d9f", { namespace: "prod" });                 // de un pod
-await oc.deploymentEvents("api", { namespace: "prod", resourceType: "dc" }); // de un deployment/dc
+// Eventos: se imprimen ordenados por fecha y se retornan como lista
+// ({ type, reason, message, kind, name, count, lastTimestamp }).
+// `warningsOnly: true` filtra solo Warning.
+await oc.events({ namespace: "prod" });                                      // de todo el namespace
+await oc.podEvents("api-7d9f", { namespace: "prod" });                       // de un pod
+await oc.deploymentEvents("api", { namespace: "prod" });                     // deployment + sus ReplicaSets
+await oc.deploymentEvents("api", { namespace: "prod", resourceType: "dc" }); // dc + sus ReplicationControllers
 ```
+
+Para tus propias consultas internas también puedes silenciar cualquier comando con `exec: { silent: true }`: no imprime el comando ni su salida (salvo con `DEBUG`), pero el resultado se retorna igual.
 
 ### `waitForDeploymentGroup` — validar todas las instancias de un mismo despliegue GitOps
 

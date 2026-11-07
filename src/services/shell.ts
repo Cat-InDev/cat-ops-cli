@@ -60,7 +60,8 @@ class Shell {
         timeout: 0,
         dryRun: false,
         shell: false,
-        env: {}
+        env: {},
+        silent: false
     };
 
     configure(options: ExecOptions = {}): this {
@@ -146,13 +147,15 @@ class Shell {
 
         return new Promise((resolve, reject) => {
 
-            logger.info(`EXEC: ${command} ${args.join(" ")}`);
+            const log = options.silent ? logger.debug : logger.info;
+
+            log(`EXEC: ${command} ${args.join(" ")}`);
 
             const runCwd = options.cwd
                 ? path.resolve(this.cwdPath, options.cwd)
                 : this.cwdPath;
 
-            logger.info(`EXEC-CWD: ${runCwd}`);
+            log(`EXEC-CWD: ${runCwd}`);
 
             if (options.dryRun) {
 
@@ -209,13 +212,13 @@ class Shell {
             child.stdout?.on("data", data => {
                 const text = data.toString();
                 stdout.push(text);
-                logger.info(text.trimEnd());
+                if (!options.silent) logger.info(text.trimEnd());
             });
 
             child.stderr?.on("data", data => {
                 const text = data.toString();
                 stderr.push(text);
-                logger.error(text.trimEnd());
+                if (!options.silent) logger.error(text.trimEnd());
             });
 
             child.on("close", code => {

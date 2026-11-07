@@ -58,6 +58,12 @@ export interface ExecOptions {
     cwd?: string;
     /** Shell compartido (con su propio `cd`/env) en el que ejecutar este comando. */
     runner?: ShellRunner;
+    /**
+     * Si es true, no imprime el comando ni su stdout/stderr (solo con DEBUG).
+     * El resultado se retorna igual. Útil para consultas internas repetitivas
+     * (p. ej. el polling de `waitForDeployment`). Default: false
+     */
+    silent?: boolean;
 }
 
 // ---------------------------------------------------------------------------

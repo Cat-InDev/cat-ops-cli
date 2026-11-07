@@ -243,6 +243,34 @@ test("oc.waitForDeploymentGroup lanza DeploymentGroupRolloutError con command='o
 // logs (actual / anterior) y eventos
 // ---------------------------------------------------------------------------
 
+function captureConsole() {
+    const lines = [];
+    const methods = ["log", "warn", "error"];
+    const originals = methods.map(name => console[name]);
+    methods.forEach(name => {
+        console[name] = (...args) => lines.push(args.join(" "));
+    });
+    return {
+        lines,
+        restore() {
+            methods.forEach((name, i) => {
+                console[name] = originals[i];
+            });
+        }
+    };
+}
+
+const quotaMessage = 'pods "api-5d8f9-x" is forbidden: exceeded quota: compute-resources, requested: limits.cpu=2, used: limits.cpu=8, limited: limits.cpu=8';
+
+const sampleEvents = {
+    items: [
+        { type: "Normal", reason: "ScalingReplicaSet", message: "Scaled up replica set api-5d8f9 to 1", lastTimestamp: "2026-11-06T10:00:00Z", involvedObject: { kind: "Deployment", name: "api" } },
+        { type: "Warning", reason: "FailedCreate", message: quotaMessage, count: 7, lastTimestamp: "2026-11-06T10:00:05Z", involvedObject: { kind: "ReplicaSet", name: "api-5d8f9" } },
+        { type: "Warning", reason: "FailedCreate", message: "otro deployment", lastTimestamp: "2026-11-06T10:00:06Z", involvedObject: { kind: "ReplicaSet", name: "api-worker-7c6b5" } },
+        { type: "Warning", reason: "BackOff", message: "Back-off restarting failed container", lastTimestamp: "2026-11-06T10:00:07Z", involvedObject: { kind: "Pod", name: "api-5d8f9-abcde" } }
+    ]
+};
+
 test("oc.logs por defecto solo trae el log actual (compatible con antes)", async () => {
 
     const capture = captureExec();
@@ -298,31 +326,92 @@ test("oc.logs con previous retorna vacío si no existe contenedor anterior", asy
 
 });
 
-test("oc.events / podEvents / deploymentEvents arman los field selectors", async () => {
+test("oc.events / podEvents consultan en silencio y arman los field selectors", async () => {
 
     const capture = captureExec();
 
     await oc.events({ namespace: "prod" });
     await oc.podEvents("api-1", { namespace: "prod", warningsOnly: true });
-    await oc.deploymentEvents("api", { namespace: "prod" });
 
     capture.restore();
 
-    assert.deepEqual(capture.calls[0], ["oc", "get", "events", "--sort-by=.lastTimestamp", "-n", "prod"]);
+    assert.deepEqual(capture.calls[0], ["oc", "get", "events", "-o", "json", "-n", "prod", { silent: true }]);
     assert.deepEqual(capture.calls[1], [
-        "oc", "get", "events", "--sort-by=.lastTimestamp",
-        "--field-selector", "involvedObject.kind=Pod,involvedObject.name=api-1,type=Warning", "-n", "prod"
-    ]);
-    assert.deepEqual(capture.calls[2], [
-        "oc", "get", "events", "--sort-by=.lastTimestamp",
-        "--field-selector", "involvedObject.kind=Deployment,involvedObject.name=api", "-n", "prod"
+        "oc", "get", "events", "-o", "json",
+        "--field-selector", "involvedObject.kind=Pod,involvedObject.name=api-1,type=Warning", "-n", "prod", { silent: true }
     ]);
 
 });
 
-test("oc.waitForDeployment con printEvents imprime eventos del deployment y sus pods al fallar", async () => {
+test("oc.deploymentEvents incluye los eventos de sus ReplicaSets (quota) y excluye otros deployments", async () => {
 
     const original = shell.exec.bind(shell);
+    const output = captureConsole();
+
+    shell.exec = () => Promise.resolve({ code: 0, stdout: JSON.stringify(sampleEvents), stderr: "" });
+
+    let list;
+
+    try {
+        list = await oc.deploymentEvents("api", { namespace: "prod" });
+    } finally {
+        shell.exec = original;
+        output.restore();
+    }
+
+    assert.deepEqual(list.map(e => `${e.kind}/${e.name}`), ["Deployment/api", "ReplicaSet/api-5d8f9"]);
+    assert.equal(list[1].count, 7);
+    assert.ok(output.lines.some(line => line.includes("exceeded quota")));
+
+});
+
+test("oc.waitForDeployment con error de quota imprime eventos del ReplicaSet solo al final", async () => {
+
+    const original = shell.exec.bind(shell);
+    const output = captureConsole();
+    const calls = [];
+
+    const deploymentJSON = {
+        spec: { replicas: 1, selector: { matchLabels: { app: "api" } } },
+        status: {
+            readyReplicas: 0,
+            updatedReplicas: 0,
+            conditions: [{ type: "ReplicaFailure", status: "True", reason: "FailedCreate", message: quotaMessage }]
+        }
+    };
+
+    shell.exec = (...args) => {
+        calls.push(args);
+        if (args.includes("events")) return Promise.resolve({ code: 0, stdout: JSON.stringify(sampleEvents), stderr: "" });
+        if (args.includes("pods")) return Promise.resolve({ code: 0, stdout: JSON.stringify({ items: [] }), stderr: "" });
+        return Promise.resolve({ code: 0, stdout: JSON.stringify(deploymentJSON), stderr: "" });
+    };
+
+    try {
+        await assert.rejects(
+            oc.waitForDeployment({ deployment: "api", pollInterval: 5, failedGracePeriod: 30, printEvents: true, printLogs: true }),
+            err => err.name === "DeploymentRolloutError" && err.status === "failed"
+        );
+    } finally {
+        shell.exec = original;
+        output.restore();
+    }
+
+    const polls = calls.filter(args => args.includes("deployment/api"));
+    const eventCalls = calls.filter(args => args.includes("events"));
+
+    assert.ok(polls.length > 2, "debe haber varias iteraciones de polling");
+    assert.equal(eventCalls.length, 1, "los eventos se consultan una sola vez, al final");
+    assert.ok(polls.every(args => args[args.length - 1].silent === true), "el polling no imprime nada");
+    assert.equal(calls.filter(args => args.includes("logs")).length, 0, "sin pods no hay logs que pedir");
+    assert.ok(output.lines.some(line => line.includes("ReplicaSet/api-5d8f9") && line.includes("exceeded quota")));
+
+});
+
+test("oc.waitForDeployment con printLogs imprime logs (actual y anterior) de cada pod al final", async () => {
+
+    const original = shell.exec.bind(shell);
+    const output = captureConsole();
     const calls = [];
 
     const deploymentJSON = {
@@ -332,33 +421,34 @@ test("oc.waitForDeployment con printEvents imprime eventos del deployment y sus 
 
     shell.exec = (...args) => {
         calls.push(args);
-        if (args.includes("deployment/api")) return Promise.resolve({ code: 0, stdout: JSON.stringify(deploymentJSON), stderr: "" });
+        if (args.includes("logs")) return Promise.resolve({ code: 0, stdout: "log", stderr: "" });
         if (args.includes("pods")) return Promise.resolve({ code: 0, stdout: JSON.stringify({ items: [{ metadata: { name: "api-1" } }, { metadata: { name: "api-2" } }] }), stderr: "" });
-        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        return Promise.resolve({ code: 0, stdout: JSON.stringify(deploymentJSON), stderr: "" });
     };
 
     try {
         await assert.rejects(
-            oc.waitForDeployment({ deployment: "api", timeout: 30, pollInterval: 10, printEvents: true }),
-            err => err.name === "DeploymentRolloutError" && err.status === "timeout"
+            oc.waitForDeployment({ deployment: "api", timeout: 30, pollInterval: 5, printLogs: { tail: 100 } }),
+            err => err.status === "timeout"
         );
-
-        const selectors = calls
-            .filter(args => args.includes("events"))
-            .map(args => args[args.indexOf("--field-selector") + 1]);
-
-        assert.deepEqual(selectors, [
-            "involvedObject.kind=Deployment,involvedObject.name=api",
-            "involvedObject.kind=Pod,involvedObject.name=api-1",
-            "involvedObject.kind=Pod,involvedObject.name=api-2"
-        ]);
     } finally {
         shell.exec = original;
+        output.restore();
     }
+
+    const logCalls = calls.filter(args => args.includes("logs"));
+
+    assert.deepEqual(logCalls, [
+        ["oc", "logs", "api-1", "--all-containers=true", "--tail", "100"],
+        ["oc", "logs", "api-1", "--all-containers=true", "--tail", "100", "--previous"],
+        ["oc", "logs", "api-2", "--all-containers=true", "--tail", "100"],
+        ["oc", "logs", "api-2", "--all-containers=true", "--tail", "100", "--previous"]
+    ]);
+    assert.equal(calls.filter(args => args.includes("events")).length, 0, "sin printEvents no se consultan eventos");
 
 });
 
-test("oc.waitForDeployment sin printEvents no consulta eventos", async () => {
+test("oc.waitForDeployment sin flags no consulta eventos ni logs", async () => {
 
     const original = shell.exec.bind(shell);
     const calls = [];
@@ -370,7 +460,7 @@ test("oc.waitForDeployment sin printEvents no consulta eventos", async () => {
 
     try {
         await assert.rejects(oc.waitForDeployment({ deployment: "api", timeout: 30, pollInterval: 10 }));
-        assert.equal(calls.filter(args => args.includes("events")).length, 0);
+        assert.equal(calls.filter(args => args.includes("events") || args.includes("logs")).length, 0);
     } finally {
         shell.exec = original;
     }

@@ -148,6 +148,8 @@ export interface OcLogsOptions extends OcOptions {
     previous?: boolean;
     /** Solo las últimas N líneas (--tail). */
     tail?: number;
+    /** Logs de todos los contenedores del pod (--all-containers). Ignora `container`. Default: false. */
+    allContainers?: boolean;
 }
 
 export interface OcLogsResult extends ExecResult {
@@ -168,11 +170,13 @@ function isPreviousLogNotFound(error: unknown): boolean {
  * del contenedor anterior:
  *   const { current, previous } = await oc.logs("api-7d9f", { previous: true, namespace: "prod" });
  */
-export async function logs(pod: string, { container, current = true, previous = false, tail, ...options }: OcLogsOptions = {}): Promise<OcLogsResult> {
+export async function logs(pod: string, { container, current = true, previous = false, tail, allContainers = false, ...options }: OcLogsOptions = {}): Promise<OcLogsResult> {
 
     const args = ["logs", pod];
 
-    if (container) {
+    if (allContainers) {
+        args.push("--all-containers=true");
+    } else if (container) {
         args.push("-c", container);
     }
 
@@ -217,27 +221,100 @@ export interface OcEventsOptions extends OcOptions {
     warningsOnly?: boolean;
 }
 
-function eventsArgs(fieldSelectors: string[], warningsOnly: boolean): string[] {
+export interface OcEvent {
+    /** "Normal" | "Warning". */
+    type: string;
+    reason: string;
+    message: string;
+    /** Kind del objeto involucrado (Pod, ReplicaSet, Deployment, ...). */
+    kind: string;
+    /** Nombre del objeto involucrado. */
+    name: string;
+    count: number;
+    lastTimestamp: string;
+}
+
+interface EventJSON {
+    type?: string;
+    reason?: string;
+    message?: string;
+    count?: number;
+    series?: { count?: number };
+    lastTimestamp?: string;
+    eventTime?: string;
+    firstTimestamp?: string;
+    metadata?: { creationTimestamp?: string };
+    involvedObject?: { kind?: string; name?: string };
+}
+
+/** Mismas opciones pero sin imprimir el comando ni su salida (consultas internas). */
+function quiet(options: OcOptions): OcOptions {
+    return { ...options, exec: { ...options.exec, silent: true } };
+}
+
+async function fetchEvents(fieldSelectors: string[], warningsOnly: boolean, options: OcOptions): Promise<OcEvent[]> {
 
     const selectors = warningsOnly ? [...fieldSelectors, "type=Warning"] : fieldSelectors;
-    const args = ["events", "--sort-by=.lastTimestamp"];
+    const args = ["events", "-o", "json"];
 
     if (selectors.length) {
         args.push("--field-selector", selectors.join(","));
     }
 
-    return args;
+    const result = await get(...args, quiet(options));
+
+    const parsed = JSON.parse(result.stdout || "{}") as { items?: EventJSON[] };
+
+    return (parsed.items ?? [])
+        .map(item => ({
+            type: item.type ?? "",
+            reason: item.reason ?? "",
+            message: (item.message ?? "").trim(),
+            kind: item.involvedObject?.kind ?? "",
+            name: item.involvedObject?.name ?? "",
+            count: item.count ?? item.series?.count ?? 1,
+            lastTimestamp: item.lastTimestamp ?? item.eventTime ?? item.firstTimestamp ?? item.metadata?.creationTimestamp ?? ""
+        }))
+        .sort((a, b) => a.lastTimestamp.localeCompare(b.lastTimestamp));
 
 }
 
-/** Eventos de todo el namespace (el de `namespace`, o el actual), ordenados por fecha. */
-export function events({ warningsOnly = false, ...options }: OcEventsOptions = {}): Promise<ExecResult> {
-    return get(...eventsArgs([], warningsOnly), options);
+function logEvents(title: string, list: OcEvent[]): void {
+
+    if (!list.length) {
+        logger.info(`${title}: sin eventos`);
+        return;
+    }
+
+    logger.warn(`${title}:`);
+
+    for (const event of list) {
+
+        const count = event.count > 1 ? ` (x${event.count})` : "";
+        const line = `  ${event.lastTimestamp} ${event.type} ${event.kind}/${event.name} ${event.reason}: ${event.message}${count}`;
+
+        if (event.type === "Warning") {
+            logger.warn(line);
+        } else {
+            logger.info(line);
+        }
+
+    }
+
 }
 
-/** Eventos de un pod individual. */
-export function podEvents(pod: string, { warningsOnly = false, ...options }: OcEventsOptions = {}): Promise<ExecResult> {
-    return get(...eventsArgs(["involvedObject.kind=Pod", `involvedObject.name=${pod}`], warningsOnly), options);
+/** Imprime (y retorna) los eventos de todo el namespace (el de `namespace`, o el actual), ordenados por fecha. */
+export async function events({ warningsOnly = false, ...options }: OcEventsOptions = {}): Promise<OcEvent[]> {
+    const list = await fetchEvents([], warningsOnly, options);
+    logEvents(`Eventos del namespace ${options.namespace ?? "actual"}`, list);
+    return list;
+}
+
+/** Imprime (y retorna) los eventos de un pod individual. */
+export async function podEvents(pod: string, { warningsOnly = false, ...options }: OcEventsOptions = {}): Promise<OcEvent[]> {
+    const list = await fetchEvents(["involvedObject.kind=Pod", `involvedObject.name=${pod}`], warningsOnly, options);
+    logEvents(`Eventos del pod ${pod}`, list);
+    return list;
 }
 
 export interface OcDeploymentEventsOptions extends OcEventsOptions {
@@ -245,10 +322,44 @@ export interface OcDeploymentEventsOptions extends OcEventsOptions {
     resourceType?: "deployment" | "dc";
 }
 
-/** Eventos de un Deployment/DeploymentConfig (escalados, fallos de rollout, etc.). */
-export function deploymentEvents(deployment: string, { resourceType = "deployment", warningsOnly = false, ...options }: OcDeploymentEventsOptions = {}): Promise<ExecResult> {
-    const kind = resourceType === "dc" ? "DeploymentConfig" : "Deployment";
-    return get(...eventsArgs([`involvedObject.kind=${kind}`, `involvedObject.name=${deployment}`], warningsOnly), options);
+/**
+ * Indica si un evento pertenece al workload: el Deployment/DeploymentConfig
+ * en sí y los objetos que crea para hacer el rollout (ReplicaSets
+ * `<name>-<hash>`, o ReplicationControllers `<name>-<n>` y deployer pods
+ * `<name>-<n>-deploy`). Los errores de quota (FailedCreate) se registran en
+ * el ReplicaSet/ReplicationController, no en el Deployment ni en los pods.
+ */
+function isWorkloadEvent(event: OcEvent, deployment: string, resourceType: "deployment" | "dc"): boolean {
+
+    const suffix = event.name.startsWith(`${deployment}-`) ? event.name.slice(deployment.length + 1) : null;
+
+    if (resourceType === "dc") {
+        if (event.kind === "DeploymentConfig") return event.name === deployment;
+        if (event.kind === "ReplicationController") return suffix !== null && /^\d+$/.test(suffix);
+        if (event.kind === "Pod") return suffix !== null && /^\d+-deploy$/.test(suffix);
+        return false;
+    }
+
+    if (event.kind === "Deployment") return event.name === deployment;
+
+    return event.kind === "ReplicaSet" && suffix !== null && /^[a-z0-9]+$/.test(suffix);
+
+}
+
+/**
+ * Imprime (y retorna) los eventos de un Deployment/DeploymentConfig,
+ * incluyendo los de sus ReplicaSets/ReplicationControllers (escalados,
+ * FailedCreate por quota, etc.).
+ */
+export async function deploymentEvents(deployment: string, { resourceType = "deployment", warningsOnly = false, ...options }: OcDeploymentEventsOptions = {}): Promise<OcEvent[]> {
+
+    const list = (await fetchEvents([], warningsOnly, options))
+        .filter(event => isWorkloadEvent(event, deployment, resourceType));
+
+    logEvents(`Eventos de ${resourceType}/${deployment}`, list);
+
+    return list;
+
 }
 
 // ---------------------------------------------------------------------------
@@ -335,18 +446,35 @@ export interface WaitForDeploymentOptions extends OcOptions {
      */
     maxRestarts?: number;
     /**
-     * Si el rollout falla (timeout, Failed o maxRestarts), imprime los eventos
-     * para saber qué está fallando: `true` = deployment y pods, o elegir con
+     * Al terminar la validación con error (timeout, Failed o maxRestarts)
+     * imprime los eventos, una sola vez, para saber qué está fallando:
+     * `true` = deployment (incluye sus ReplicaSets/ReplicationControllers,
+     * donde aparecen p. ej. los errores de quota) y pods; o elegir con
      * `{ deployment: true, pods: true }`. Default: no imprime.
      */
     printEvents?: boolean | PrintEventsOptions;
+    /**
+     * Al terminar la validación con error imprime, una sola vez, el log de
+     * cada pod: `true` = actual + anterior (--previous), o elegir con
+     * `{ current, previous, tail }`. Default: no imprime.
+     */
+    printLogs?: boolean | PrintLogsOptions;
 }
 
 export interface PrintEventsOptions {
-    /** Eventos del deployment en sí. */
+    /** Eventos del deployment y de sus ReplicaSets/ReplicationControllers (quota, FailedCreate, escalados). */
     deployment?: boolean;
     /** Eventos de cada pod del deployment (ImagePullBackOff, FailedScheduling, probes, etc.). */
     pods?: boolean;
+}
+
+export interface PrintLogsOptions {
+    /** Log del contenedor actual. Default: true. */
+    current?: boolean;
+    /** Log del contenedor anterior (--previous); vacío si no existe. Default: true. */
+    previous?: boolean;
+    /** Solo las últimas N líneas. */
+    tail?: number;
 }
 
 type SelectorLike = { matchLabels?: Record<string, string> } | Record<string, string> | undefined;
@@ -424,53 +552,98 @@ async function listPodNames(matchLabels: Record<string, string> | undefined, opt
 
 }
 
+function errorText(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return (error as Partial<ExecResult>)?.stderr?.trim() || String(error);
+}
+
+interface DiagnosticsOptions {
+    printEvents?: boolean | PrintEventsOptions;
+    printLogs?: boolean | PrintLogsOptions;
+}
+
 /**
- * Imprime los eventos del deployment y/o de sus pods antes de reportar el
- * fallo. Nunca lanza: si no se pueden leer los eventos solo se avisa, para
- * no tapar el error original del rollout.
+ * Se llama una sola vez, al terminar la validación con error: imprime las
+ * condiciones del recurso y, según los flags, sus eventos y los logs de sus
+ * pods. Nunca lanza, para no tapar el error original del rollout.
  */
-async function printFailureEvents(
+async function printDiagnostics(
     deployment: string,
     resourceType: "deployment" | "dc",
-    matchLabels: Record<string, string> | undefined,
-    printEvents: boolean | PrintEventsOptions,
+    { printEvents = false, printLogs = false }: DiagnosticsOptions,
     options: OcOptions
 ): Promise<void> {
 
-    const printDeployment = printEvents === true || (typeof printEvents === "object" && Boolean(printEvents.deployment));
-    const printPods = printEvents === true || (typeof printEvents === "object" && Boolean(printEvents.pods));
+    const eventsConfig: PrintEventsOptions = printEvents === true ? { deployment: true, pods: true } : printEvents || {};
+    const logsConfig: PrintLogsOptions | false = printLogs === true ? {} : printLogs;
 
-    if (printDeployment) {
+    if (!eventsConfig.deployment && !eventsConfig.pods && !logsConfig) return;
+
+    logger.warn(`----- Diagnóstico de ${resourceType}/${deployment} -----`);
+
+    let matchLabels: Record<string, string> | undefined;
+
+    try {
+
+        const json = await readWorkloadJSON(resourceType, deployment, quiet(options));
+
+        matchLabels = matchLabelsOf(json.spec?.selector);
+
+        for (const condition of json.status?.conditions ?? []) {
+            const reason = condition.reason ? ` (${condition.reason})` : "";
+            const message = condition.message ? `: ${condition.message}` : "";
+            logger.warn(`Condición ${condition.type}=${condition.status}${reason}${message}`);
+        }
+
+    } catch (error) {
+        logger.warn(`No se pudo leer ${resourceType}/${deployment}: ${errorText(error)}`);
+    }
+
+    if (eventsConfig.deployment) {
         try {
-            logger.warn(`Eventos de ${resourceType}/${deployment}:`);
             await deploymentEvents(deployment, { resourceType, ...options });
         } catch (error) {
-            logger.warn(`No se pudieron obtener los eventos de "${deployment}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+            logger.warn(`No se pudieron obtener los eventos de "${deployment}": ${errorText(error)}`);
         }
     }
 
-    if (!printPods) return;
+    if (!eventsConfig.pods && !logsConfig) return;
 
-    let pods: string[];
+    let pods: string[] = [];
 
     try {
-        pods = await listPodNames(matchLabels, options);
+        pods = await listPodNames(matchLabels, quiet(options));
     } catch (error) {
-        logger.warn(`No se pudieron listar los pods de "${deployment}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+        logger.warn(`No se pudieron listar los pods de "${deployment}": ${errorText(error)}`);
         return;
     }
 
     if (!pods.length) {
-        logger.warn(`No se encontraron pods de "${deployment}" para mostrar eventos`);
+        logger.warn(`"${deployment}" no tiene pods; si no se pudieron crear (p. ej. quota), la causa está en los eventos del deployment`);
         return;
     }
 
+    if (eventsConfig.pods) {
+        try {
+            const podNames = new Set(pods);
+            const list = (await fetchEvents(["involvedObject.kind=Pod"], false, options))
+                .filter(event => podNames.has(event.name));
+            logEvents(`Eventos de los pods de "${deployment}"`, list);
+        } catch (error) {
+            logger.warn(`No se pudieron obtener los eventos de los pods de "${deployment}": ${errorText(error)}`);
+        }
+    }
+
+    if (!logsConfig) return;
+
+    const { current = true, previous = true, tail } = logsConfig;
+
     for (const pod of pods) {
         try {
-            logger.warn(`Eventos del pod ${pod}:`);
-            await podEvents(pod, options);
+            logger.warn(`Logs del pod ${pod}:`);
+            await logs(pod, { current, previous, tail, allContainers: true, ...options });
         } catch (error) {
-            logger.warn(`No se pudieron obtener los eventos del pod "${pod}": ${error instanceof Error ? error.message : (error as ExecResult)?.stderr ?? String(error)}`);
+            logger.warn(`No se pudieron obtener los logs del pod "${pod}": ${errorText(error)}`);
         }
     }
 
@@ -497,18 +670,19 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
         failedGracePeriod = pollInterval * 6,
         maxRestarts,
         printEvents = false,
+        printLogs = false,
         ...ocOptions
     } = options;
 
     const startedAt = Date.now();
     let failedSince: number | null = null;
-    let matchLabels: Record<string, string> | undefined;
 
-    // Imprime los eventos (si se pidió) y arma el error a lanzar.
+    // El polling no imprime nada en cada iteración; solo el resultado final.
+    const pollOptions = quiet(ocOptions);
+
+    // Eventos/logs (si se pidieron) una sola vez, al terminar con error.
     const fail = async (message: string, info: Omit<DeploymentWatchResult, "message">): Promise<DeploymentRolloutError> => {
-        if (printEvents) {
-            await printFailureEvents(deployment, resourceType, matchLabels, printEvents, ocOptions);
-        }
+        await printDiagnostics(deployment, resourceType, { printEvents, printLogs }, ocOptions);
         return new DeploymentRolloutError(message, info);
     };
 
@@ -524,14 +698,14 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
         let json: OcWorkloadJSON;
 
         try {
-            json = await readWorkloadJSON(resourceType, deployment, ocOptions);
+            json = await readWorkloadJSON(resourceType, deployment, pollOptions);
         } catch {
             // El recurso puede no existir todavía (justo después de un apply); reintenta.
             await sleep(pollInterval);
             continue;
         }
 
-        matchLabels = matchLabelsOf(json.spec?.selector);
+        const matchLabels = matchLabelsOf(json.spec?.selector);
 
         const desired = json.spec?.replicas ?? 1;
         const ready = json.status?.readyReplicas ?? json.status?.availableReplicas ?? 0;
@@ -544,7 +718,7 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
 
         if (maxRestarts !== undefined) {
 
-            restarts = await countPodRestarts(matchLabels, ocOptions);
+            restarts = await countPodRestarts(matchLabels, pollOptions);
 
             if (restarts > maxRestarts) {
                 const message = `"${deployment}" superó el máximo de reinicios permitido (${restarts} > ${maxRestarts})`;
@@ -641,8 +815,10 @@ export interface WaitForDeploymentGroupOptions extends OcOptions {
     failedGracePeriod?: number;
     /** Igual que en waitForDeployment, aplicado a cada instancia del grupo. */
     maxRestarts?: number;
-    /** Igual que en waitForDeployment, aplicado a cada instancia del grupo que falle. */
+    /** Igual que en waitForDeployment: se imprime al final, por cada instancia que falle. */
     printEvents?: boolean | PrintEventsOptions;
+    /** Igual que en waitForDeployment: se imprime al final, por cada instancia que falle. */
+    printLogs?: boolean | PrintLogsOptions;
 }
 
 function toSelectorString(label: string | Record<string, string>): string {
@@ -694,6 +870,7 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
         failedGracePeriod = pollInterval * 6,
         maxRestarts,
         printEvents,
+        printLogs,
         ...ocOptions
     } = options;
 
@@ -722,7 +899,6 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
             pollInterval,
             failedGracePeriod,
             maxRestarts,
-            printEvents,
             ...ocOptions
         }))
     );
@@ -754,6 +930,11 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
     const elapsedMs = Date.now() - startedAt;
 
     if (failed.length) {
+
+        // Diagnóstico al final, de a una instancia para que no se mezcle la salida.
+        for (const failure of failed) {
+            await printDiagnostics(failure.deployment, resourceType, { printEvents, printLogs }, ocOptions);
+        }
 
         const summary = failed.map(f => `${f.deployment} (${f.status})`).join(", ");
         const message = `${failed.length}/${names.length} instancias del grupo "${selector}" no llegaron a estado exitoso: ${summary}`;
