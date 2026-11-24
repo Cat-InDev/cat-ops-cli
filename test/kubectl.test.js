@@ -550,7 +550,7 @@ test("kubectl.waitForDeployment con printLogs imprime logs (actual y anterior) d
         ["kubectl", "logs", "api-2", "--all-containers=true", "--tail", "100"],
         ["kubectl", "logs", "api-2", "--all-containers=true", "--tail", "100", "--previous"]
     ]);
-    assert.equal(calls.filter(args => args.includes("events")).length, 0, "sin printEvents no se consultan eventos");
+    assert.equal(calls.filter(args => args.includes("events")).length, 1, "los eventos se consultan una sola vez, para el diagnóstico de causas");
 
 });
 
@@ -566,9 +566,82 @@ test("kubectl.waitForDeployment sin flags no consulta eventos ni logs", async ()
 
     try {
         await assert.rejects(kubectl.waitForDeployment({ deployment: "api", timeout: 30, pollInterval: 10 }));
-        assert.equal(calls.filter(args => args.includes("events") || args.includes("logs")).length, 0);
+        assert.equal(calls.filter(args => args.includes("logs")).length, 0, "sin printLogs no se piden logs");
+        assert.equal(calls.filter(args => args.includes("events")).length, 1, "eventos: una sola consulta, para el diagnóstico");
     } finally {
         shell.exec = original;
     }
+
+});
+
+test("kubectl.waitForDeployment imprime periódicamente el estado del deployment y una línea por pod", async () => {
+
+    const original = shell.exec.bind(shell);
+    const output = captureConsole();
+
+    const deploymentJSON = {
+        spec: { replicas: 2, selector: { matchLabels: { app: "api" } } },
+        status: { readyReplicas: 1, updatedReplicas: 2, conditions: [{ type: "Progressing", status: "True", reason: "ReplicaSetUpdated" }] }
+    };
+
+    const podsJSON = {
+        items: [
+            {
+                metadata: { name: "api-1", creationTimestamp: new Date(Date.now() - 65_000).toISOString() },
+                spec: { nodeName: "node-a", containers: [{}] },
+                status: { phase: "Running", containerStatuses: [{ ready: true, restartCount: 0, state: { running: {} } }] }
+            },
+            {
+                metadata: { name: "api-2", creationTimestamp: new Date().toISOString() },
+                spec: { containers: [{}] },
+                status: { phase: "Running", containerStatuses: [{ ready: false, restartCount: 3, state: { waiting: { reason: "CrashLoopBackOff" } }, lastState: { terminated: { reason: "OOMKilled" } } }] }
+            }
+        ]
+    };
+
+    shell.exec = (...args) => {
+        if (args.includes("pods")) return Promise.resolve({ code: 0, stdout: JSON.stringify(podsJSON), stderr: "" });
+        return Promise.resolve({ code: 0, stdout: JSON.stringify(deploymentJSON), stderr: "" });
+    };
+
+    try {
+        await assert.rejects(kubectl.waitForDeployment({ deployment: "api", timeout: 40, pollInterval: 5, statusInterval: 1000 }));
+    } finally {
+        shell.exec = original;
+        output.restore();
+    }
+
+    const summary = output.lines.filter(line => line.includes("[deployment/api] esperando rollout"));
+    assert.equal(summary.length, 1, "respeta statusInterval");
+    assert.ok(summary[0].includes("listas=1/2") && summary[0].includes("Progressing=True (ReplicaSetUpdated)"));
+
+    const pod1 = output.lines.find(line => line.includes("pod api-1"));
+    const pod2 = output.lines.find(line => line.includes("pod api-2"));
+    assert.ok(pod1.includes("status=Running") && pod1.includes("ready=1/1") && pod1.includes("age=1m5s") && pod1.includes("node=node-a"));
+    assert.ok(pod2.includes("status=CrashLoopBackOff") && pod2.includes("ready=0/1") && pod2.includes("restarts=3 (último: OOMKilled)"));
+    assert.ok(!pod1.includes("\n") && !pod2.includes("\n"), "una línea por pod");
+
+});
+
+test("kubectl.waitForDeployment con statusInterval: 0 no imprime estado", async () => {
+
+    const original = shell.exec.bind(shell);
+    const output = captureConsole();
+    const calls = [];
+
+    shell.exec = (...args) => {
+        calls.push(args);
+        return Promise.resolve({ code: 0, stdout: JSON.stringify({ spec: { replicas: 1, selector: { matchLabels: { app: "api" } } }, status: {} }), stderr: "" });
+    };
+
+    try {
+        await assert.rejects(kubectl.waitForDeployment({ deployment: "api", timeout: 20, pollInterval: 5, statusInterval: 0 }));
+    } finally {
+        shell.exec = original;
+        output.restore();
+    }
+
+    assert.ok(!output.lines.some(line => line.includes("esperando rollout")));
+    assert.ok(!output.lines.some(line => line.includes(" pod api-")), "sin líneas de estado por pod");
 
 });

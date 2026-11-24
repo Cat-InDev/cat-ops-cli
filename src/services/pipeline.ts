@@ -1,4 +1,5 @@
 import { logger } from "../core/logger";
+import { builtInErrorCode } from "../core/errorCodes";
 import type { Context } from "../core/Context";
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,8 @@ export interface PipelineRunResult {
     status: "success" | "failed";
     results: Record<string, unknown>;
     error?: unknown;
+    /** Código del error si falló (resuelto por `ctx.notifier`; `GEN-xxx` si no tiene uno propio). */
+    errorCode?: string;
     duration: number;
 }
 
@@ -397,6 +400,7 @@ export class Pipeline {
     private _results: Record<string, unknown> = {};
     private _status: PipelineEntityStatus = "pending";
     private _error: unknown = undefined;
+    private _errorCode: string | undefined = undefined;
     private _duration = 0;
 
     constructor(name: string, config?: PipelineConfig) {
@@ -503,7 +507,8 @@ export class Pipeline {
         } catch (err) {
             this._error = err;
             this._status = "failed";
-            logger.error(`Pipeline "${this.name}" failed: ${err instanceof Error ? err.message : String(err)}`);
+            this._errorCode = ctx.notifier?.resolveCode ? ctx.notifier.resolveCode(err, ctx) : builtInErrorCode(err);
+            logger.error(`[${this._errorCode}] Pipeline "${this.name}" failed: ${err instanceof Error ? err.message : String(err)}`);
         } finally {
             this._duration = Date.now() - start;
         }
@@ -512,6 +517,7 @@ export class Pipeline {
             status: this._status as "success" | "failed",
             results: this._results,
             error: this._error,
+            ...(this._errorCode ? { errorCode: this._errorCode } : {}),
             duration: this._duration
         };
     }
@@ -520,6 +526,7 @@ export class Pipeline {
         this._status = "pending";
         this._results = {};
         this._error = undefined;
+        this._errorCode = undefined;
         this._duration = 0;
         for (const stage of this.stages.values()) {
             stage.reset();

@@ -1,6 +1,7 @@
 import type { Context } from "./Context";
 import type { ErrorMessageFormatter } from "./types";
 import { ServiceError } from "./types";
+import { builtInErrorCode, codeMatches } from "./errorCodes";
 
 interface ExecLikeError {
     command?: string;
@@ -10,14 +11,15 @@ interface ExecLikeError {
     message?: string;
 }
 
-function unwrapExecLike(error: unknown): ExecLikeError {
+export function unwrapExecLike(error: unknown): ExecLikeError {
     if (error instanceof ServiceError && error.cause) {
         return error.cause as ExecLikeError;
     }
     return error as ExecLikeError;
 }
 
-function textOf(error: unknown): string {
+/** Texto del error (stderr, stdout, message), desenvolviendo ServiceError. */
+export function textOf(error: unknown): string {
     if (error instanceof ServiceError && error.cause) {
         const cause = error.cause as ExecLikeError;
         return cause.stderr || cause.stdout || cause.message || String(error.cause);
@@ -113,7 +115,7 @@ export interface MessageRule {
     message: string | ((error: unknown, ctx: Context) => string);
 }
 
-function commandMatches(rule: MessageRule, command: string | undefined): boolean {
+function commandMatches(rule: ErrorRuleConditions, command: string | undefined): boolean {
 
     if (!rule.command) return true;
     if (!command) return false;
@@ -124,7 +126,7 @@ function commandMatches(rule: MessageRule, command: string | undefined): boolean
 
 }
 
-function argsMatch(rule: MessageRule, args: string[] | undefined): boolean {
+function argsMatch(rule: ErrorRuleConditions, args: string[] | undefined): boolean {
 
     if (!rule.args) return true;
     if (!args || !args.length) return false;
@@ -139,11 +141,25 @@ function argsMatch(rule: MessageRule, args: string[] | undefined): boolean {
 
 }
 
-function patternMatches(rule: MessageRule, text: string): boolean {
+function patternMatches(rule: ErrorRuleConditions, text: string): boolean {
 
     if (!rule.pattern) return true;
 
     return rule.pattern.test(text);
+
+}
+
+/** Condiciones de una regla (comando + args + patrón, en AND), sin el resultado. */
+export type ErrorRuleConditions = Pick<MessageRule, "command" | "args" | "pattern">;
+
+/** true si el error cumple TODAS las condiciones de la regla (las omitidas no filtran). */
+export function matchesErrorRule(rule: ErrorRuleConditions, error: unknown): boolean {
+
+    const execError = unwrapExecLike(error);
+
+    return commandMatches(rule, execError?.command)
+        && argsMatch(rule, execError?.args)
+        && patternMatches(rule, textOf(error));
 
 }
 
@@ -183,16 +199,9 @@ export function byRule(rules: MessageRule[]): ErrorMessageFormatter {
 
     return (error: unknown, ctx: Context) => {
 
-        const execError = unwrapExecLike(error);
-        const text = textOf(error);
-
         for (const rule of rules) {
 
-            const matches = commandMatches(rule, execError?.command)
-                && argsMatch(rule, execError?.args)
-                && patternMatches(rule, text);
-
-            if (matches) {
+            if (matchesErrorRule(rule, error)) {
                 return typeof rule.message === "function"
                     ? rule.message(error, ctx)
                     : rule.message;
@@ -226,6 +235,32 @@ export function byService(map: Record<string, string>): ErrorMessageFormatter {
         }
 
         return undefined;
+
+    };
+
+}
+
+/**
+ * Formateador de fábrica: mensaje fijo por código de error (exacto, glob
+ * "K8S-2*" o RegExp como clave). Para algo más completo (mensaje dinámico,
+ * cambiar el área, matchear causas secundarias) usa `notifier.mapCode`.
+ *
+ * Ejemplo:
+ *   notifier.describeError(messages.byCode({
+ *       "K8S-102-MAXREINIT": "La app se reinicia en bucle, revisar logs",
+ *       "GEN-001-EXEC": "Falló un comando del pipeline"
+ *   }));
+ */
+export function byCode(map: Record<string, string>): ErrorMessageFormatter {
+
+    const entries = Object.entries(map);
+
+    return (error: unknown, ctx: Context) => {
+
+        const code = ctx?.notifier?.resolveCode ? ctx.notifier.resolveCode(error, ctx) : builtInErrorCode(error);
+        const found = entries.find(([matcher]) => codeMatches(matcher, code));
+
+        return found?.[1];
 
     };
 

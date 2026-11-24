@@ -1,5 +1,19 @@
 import { shell } from "./shell";
 import { logger } from "../core/logger";
+import {
+    ROLLOUT_ERRORS,
+    classifyReadError,
+    diagnoseRollout,
+    formatDuration,
+    logPodLine,
+    logRolloutFailure,
+    summarizeCauses
+} from "./k8s-rollout";
+import type { PodJSON, RolloutCause, RolloutErrorKey } from "./k8s-rollout";
+
+// Catálogo de errores de rollout (compartido con oc).
+export { ROLLOUT_ERRORS, rolloutErrorCatalog, diagnoseRollout } from "./k8s-rollout";
+export type { RolloutCause, RolloutErrorDefinition, RolloutErrorKey, RolloutErrorLevel } from "./k8s-rollout";
 import type { ExecOptions, ExecResult } from "../core/types";
 
 // ---------------------------------------------------------------------------
@@ -352,14 +366,23 @@ export class DeploymentRolloutError extends Error {
     readonly deployment: string;
     readonly elapsedMs: number;
     readonly restarts: number;
+    /** Código principal del catálogo (K8S-1xx), p. ej. "K8S-102-MAXREINIT". */
+    readonly code: string;
+    /** Clave del código principal, p. ej. "MAX_RESTARTS_EXCEEDED". */
+    readonly errorKey: RolloutErrorKey;
+    /** Causas secundarias detectadas (K8S-2xx): OOMKilled, ImagePull, probes, quota, etc. */
+    readonly causes: RolloutCause[];
 
-    constructor(message: string, info: Omit<DeploymentWatchResult, "message">) {
+    constructor(message: string, info: Omit<DeploymentWatchResult, "message"> & { errorKey?: RolloutErrorKey; causes?: RolloutCause[] }) {
         super(message);
         this.name = "DeploymentRolloutError";
         this.status = info.status;
         this.deployment = info.deployment;
         this.elapsedMs = info.elapsedMs;
         this.restarts = info.restarts;
+        this.errorKey = info.errorKey ?? (info.status === "timeout" ? "ROLLOUT_TIMEOUT" : "ROLLOUT_FAILED");
+        this.code = ROLLOUT_ERRORS[this.errorKey].code;
+        this.causes = info.causes ?? [];
     }
 
 }
@@ -397,6 +420,12 @@ export interface WaitForDeploymentOptions extends KubectlOptions {
      * `{ current, previous, tail }`. Default: no imprime.
      */
     printLogs?: boolean | PrintLogsOptions;
+    /**
+     * Cada cuántos milisegundos imprimir el estado del rollout mientras se
+     * espera: un resumen del deployment y una línea por pod (status, ready,
+     * restarts, age, node). `0` lo desactiva. Default: 15000.
+     */
+    statusInterval?: number;
 }
 
 export interface PrintEventsOptions {
@@ -454,6 +483,21 @@ function isProgressingFailed(conditions: DeploymentConditionJSON[]): boolean {
 
 }
 
+/** Código principal según la condición que dejó el recurso en Failed. */
+function failedConditionKey(conditions: DeploymentConditionJSON[]): RolloutErrorKey {
+    if (conditions.some(c => c.type === "ReplicaFailure" && c.status === "True")) return "REPLICA_FAILURE";
+    const progressing = conditions.find(c => c.type === "Progressing");
+    if (progressing?.status === "False" && progressing.reason === "ProgressDeadlineExceeded") return "PROGRESS_DEADLINE_EXCEEDED";
+    return "ROLLOUT_FAILED";
+}
+
+function describeFailedCondition(conditions: DeploymentConditionJSON[]): string {
+    const condition = conditions.find(c => c.type === "ReplicaFailure" && c.status === "True")
+        ?? conditions.find(c => c.type === "Progressing" && c.status === "False");
+    if (!condition) return "";
+    return `${condition.type}=${condition.status}${condition.reason ? ` ${condition.reason}` : ""}`;
+}
+
 async function listPodNames(matchLabels: Record<string, string> | undefined, options: KubectlOptions): Promise<string[]> {
 
     if (!matchLabels || !Object.keys(matchLabels).length) {
@@ -494,7 +538,9 @@ interface DiagnosticsOptions {
 async function printDiagnostics(
     deployment: string,
     { printEvents = false, printLogs = false }: DiagnosticsOptions,
-    options: KubectlOptions
+    options: KubectlOptions,
+    /** Eventos del namespace ya consultados por el diagnóstico (evita repetir la consulta). */
+    prefetchedEvents?: KubectlEvent[]
 ): Promise<void> {
 
     const eventsConfig: PrintEventsOptions = printEvents === true ? { deployment: true, pods: true } : printEvents || {};
@@ -524,7 +570,11 @@ async function printDiagnostics(
 
     if (eventsConfig.deployment) {
         try {
-            await deploymentEvents(deployment, options);
+            if (prefetchedEvents) {
+                logEvents(`Eventos de deployment/${deployment}`, prefetchedEvents.filter(event => isWorkloadEvent(event, deployment)));
+            } else {
+                await deploymentEvents(deployment, options);
+            }
         } catch (error) {
             logger.warn(`No se pudieron obtener los eventos de "${deployment}": ${errorText(error)}`);
         }
@@ -549,8 +599,8 @@ async function printDiagnostics(
     if (eventsConfig.pods) {
         try {
             const podNames = new Set(pods);
-            const list = (await fetchEvents(["involvedObject.kind=Pod"], false, options))
-                .filter(event => podNames.has(event.name));
+            const source = prefetchedEvents ?? await fetchEvents(["involvedObject.kind=Pod"], false, options);
+            const list = source.filter(event => event.kind === "Pod" && podNames.has(event.name));
             logEvents(`Eventos de los pods de "${deployment}"`, list);
         } catch (error) {
             logger.warn(`No se pudieron obtener los eventos de los pods de "${deployment}": ${errorText(error)}`);
@@ -568,6 +618,116 @@ async function printDiagnostics(
         } catch (error) {
             logger.warn(`No se pudieron obtener los logs del pod "${pod}": ${errorText(error)}`);
         }
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// Log periódico de estado — una línea por pod, para que se vea el avance
+// del rollout y no parezca que el proceso se quedó pegado.
+// ---------------------------------------------------------------------------
+
+async function listPods(matchLabels: Record<string, string> | undefined, options: KubectlOptions): Promise<PodJSON[]> {
+
+    if (!matchLabels || !Object.keys(matchLabels).length) return [];
+
+    const selector = Object.entries(matchLabels)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(",");
+
+    const result = await get("pods", "-l", selector, "-o", "json", quiet(options));
+
+    return (JSON.parse(result.stdout || "{}") as { items?: PodJSON[] }).items ?? [];
+
+}
+
+/**
+ * Ventana hacia atrás (desde que empezó la espera) para considerar eventos
+ * del Deployment/ReplicaSets en el diagnóstico, para no culpar al rollout
+ * actual por eventos viejos de otro rollout.
+ */
+const DIAGNOSIS_EVENT_WINDOW_MS = 10 * 60_000;
+
+interface DiagnosisResult {
+    causes: RolloutCause[];
+    /** Eventos crudos del namespace, para reutilizarlos en `printDiagnostics`. */
+    events?: KubectlEvent[];
+}
+
+/** Consulta pods + eventos una vez y arma las causas secundarias (K8S-2xx). Nunca lanza. */
+async function collectDiagnosis(
+    deployment: string,
+    conditions: DeploymentConditionJSON[],
+    matchLabels: Record<string, string> | undefined,
+    startedAt: number,
+    options: KubectlOptions
+): Promise<DiagnosisResult> {
+
+    let pods: PodJSON[] = [];
+    let events: KubectlEvent[] | undefined;
+
+    try { pods = await listPods(matchLabels, options); } catch { /* sin pods en el diagnóstico */ }
+    try { events = await fetchEvents([], false, options); } catch { /* sin eventos en el diagnóstico */ }
+
+    const podNames = new Set(pods.map(pod => pod.metadata?.name));
+    const since = startedAt - DIAGNOSIS_EVENT_WINDOW_MS;
+    const isRecent = (event: KubectlEvent) => !event.lastTimestamp || Date.parse(event.lastTimestamp) >= since;
+
+    const relevant = (events ?? []).filter(event =>
+        (event.kind === "Pod" && podNames.has(event.name))
+        || (isWorkloadEvent(event, deployment) && isRecent(event))
+    );
+
+    return { causes: diagnoseRollout({ workload: deployment, conditions, pods, events: relevant }), events };
+
+}
+
+interface StatusSnapshot {
+    resource: string;
+    elapsedMs: number;
+    timeout: number;
+    desired: number;
+    ready: number;
+    updated: number;
+    conditions: Array<{ type: string; status: string; reason?: string }>;
+    matchLabels: Record<string, string> | undefined;
+}
+
+/** Imprime el resumen del recurso + una línea por pod. Nunca lanza. */
+async function logRolloutStatus(snapshot: StatusSnapshot, options: KubectlOptions): Promise<void> {
+
+    const { resource, elapsedMs, timeout, desired, ready, updated, conditions, matchLabels } = snapshot;
+    const prefix = `[${resource}]`;
+
+    const progressing = conditions.find(c => c.type === "Progressing");
+    const condition = progressing ? ` | Progressing=${progressing.status}${progressing.reason ? ` (${progressing.reason})` : ""}` : "";
+
+    logger.info(`${prefix} esperando rollout | ${formatDuration(elapsedMs)}/${formatDuration(timeout)} | listas=${ready}/${desired} | actualizadas=${updated}/${desired}${condition}`);
+
+    if (!matchLabels || !Object.keys(matchLabels).length) return;
+
+    try {
+
+        const selector = Object.entries(matchLabels)
+            .map(([key, value]) => `${key}=${value}`)
+            .join(",");
+
+        const result = await get("pods", "-l", selector, "-o", "json", quiet(options));
+        const pods = (JSON.parse(result.stdout || "{}") as { items?: PodJSON[] }).items ?? [];
+
+        if (!pods.length) {
+            logger.warn(`${prefix} sin pods todavía (si no se crean, revisar eventos: quota, FailedCreate, etc.)`);
+            return;
+        }
+
+        const now = Date.now();
+
+        for (const pod of pods) {
+            logPodLine(prefix, pod, now);
+        }
+
+    } catch (error) {
+        logger.warn(`${prefix} no se pudo consultar el estado de los pods: ${errorText(error)}`);
     }
 
 }
@@ -593,19 +753,41 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
         maxRestarts,
         printEvents = false,
         printLogs = false,
+        statusInterval = 15_000,
         ...kubectlOptions
     } = options;
 
     const startedAt = Date.now();
     let failedSince: number | null = null;
+    let lastStatusAt: number | null = null;
 
     // El polling no imprime nada en cada iteración; solo el resultado final.
     const pollOptions = quiet(kubectlOptions);
 
-    // Eventos/logs (si se pidieron) una sola vez, al terminar con error.
-    const fail = async (message: string, info: Omit<DeploymentWatchResult, "message">): Promise<DeploymentRolloutError> => {
-        await printDiagnostics(deployment, { printEvents, printLogs }, kubectlOptions);
-        return new DeploymentRolloutError(message, info);
+    // Último estado leído del recurso (para diagnosticar al fallar).
+    let lastSeen: { conditions: DeploymentConditionJSON[]; matchLabels: Record<string, string> | undefined } | null = null;
+    let lastReadError = "";
+
+    // Al terminar con error, una sola vez: causas (K8S-2xx) + eventos/logs si se pidieron.
+    const fail = async (key: RolloutErrorKey, detail: string, info: Omit<DeploymentWatchResult, "message">): Promise<DeploymentRolloutError> => {
+
+        const { code } = ROLLOUT_ERRORS[key];
+        let causes: RolloutCause[] = [];
+
+        if (lastSeen) {
+            const diagnosis = await collectDiagnosis(deployment, lastSeen.conditions, lastSeen.matchLabels, startedAt, kubectlOptions);
+            causes = diagnosis.causes;
+            logRolloutFailure(`deployment/${deployment}`, code, detail, causes);
+            await printDiagnostics(deployment, { printEvents, printLogs }, kubectlOptions, diagnosis.events);
+        } else {
+            logRolloutFailure(`deployment/${deployment}`, code, detail, causes);
+        }
+
+        const summary = summarizeCauses(causes);
+        const message = `[${code}] ${detail}${summary ? ` | ${summary}` : ""}`;
+
+        return new DeploymentRolloutError(message, { ...info, errorKey: key, causes });
+
     };
 
     while (true) {
@@ -613,21 +795,43 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
         const elapsedMs = Date.now() - startedAt;
 
         if (elapsedMs >= timeout) {
+
+            if (!lastSeen && lastReadError) {
+                // Nunca se pudo leer el recurso: no es un rollout lento, es que no existe o no hay cluster.
+                const notFound = classifyReadError(lastReadError) === "notFound";
+                const key: RolloutErrorKey = notFound ? "RESOURCE_NOT_FOUND" : "CLUSTER_UNREACHABLE";
+                const detail = notFound
+                    ? `deployment/${deployment} no existe (esperado ${timeout}ms): ${lastReadError}`
+                    : `No se pudo consultar deployment/${deployment} durante ${timeout}ms: ${lastReadError}`;
+                throw await fail(key, detail, { status: notFound ? "failed" : "timeout", deployment, elapsedMs, restarts: -1 });
+            }
+
             const message = `Timeout esperando el rollout de "${deployment}" (${timeout}ms)`;
-            throw await fail(message, { status: "timeout", deployment, elapsedMs, restarts: -1 });
+            throw await fail("ROLLOUT_TIMEOUT", message, { status: "timeout", deployment, elapsedMs, restarts: -1 });
+
         }
 
         let json: DeploymentJSON;
 
         try {
             json = await readDeploymentJSON(deployment, pollOptions);
-        } catch {
+        } catch (error) {
+
+            lastReadError = errorText(error);
+
+            // Sin permisos / credenciales inválidas no se arregla solo: se aborta ya.
+            if (classifyReadError(lastReadError) === "access") {
+                throw await fail("ACCESS_DENIED", `Sin acceso a deployment/${deployment}: ${lastReadError}`, { status: "failed", deployment, elapsedMs, restarts: -1 });
+            }
+
             // El recurso puede no existir todavía (justo después de un apply); reintenta.
             await sleep(pollInterval);
             continue;
+
         }
 
         const matchLabels = json.spec?.selector?.matchLabels;
+        lastSeen = { conditions: json.status?.conditions ?? [], matchLabels };
 
         const desired = json.spec?.replicas ?? 1;
         const ready = json.status?.readyReplicas ?? 0;
@@ -644,7 +848,7 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
 
             if (restarts > maxRestarts) {
                 const message = `Deployment "${deployment}" superó el máximo de reinicios permitido (${restarts} > ${maxRestarts})`;
-                throw await fail(message, { status: "failed", deployment, elapsedMs, restarts });
+                throw await fail("MAX_RESTARTS_EXCEEDED", message, { status: "failed", deployment, elapsedMs, restarts });
             }
 
         }
@@ -654,13 +858,29 @@ export async function waitForDeployment(options: WaitForDeploymentOptions): Prom
             return { status: "success", deployment, elapsedMs, restarts, message };
         }
 
+        if (statusInterval > 0 && (lastStatusAt === null || Date.now() - lastStatusAt >= statusInterval)) {
+            lastStatusAt = Date.now();
+            await logRolloutStatus({
+                resource: `deployment/${deployment}`,
+                elapsedMs: Date.now() - startedAt,
+                timeout,
+                desired,
+                ready,
+                updated,
+                conditions,
+                matchLabels
+            }, kubectlOptions);
+        }
+
         if (failed) {
 
             if (failedSince === null) {
                 failedSince = Date.now();
             } else if (Date.now() - failedSince >= failedGracePeriod) {
-                const message = `Deployment "${deployment}" quedó en estado Failed y no se recuperó en ${failedGracePeriod}ms`;
-                throw await fail(message, { status: "failed", deployment, elapsedMs, restarts });
+                const key = failedConditionKey(conditions);
+                const condition = describeFailedCondition(conditions);
+                const message = `Deployment "${deployment}" quedó en estado Failed y no se recuperó en ${failedGracePeriod}ms${condition ? ` (${condition})` : ""}`;
+                throw await fail(key, message, { status: "failed", deployment, elapsedMs, restarts });
             }
 
         } else {
@@ -685,6 +905,11 @@ export interface DeploymentGroupFailure {
     deployment: string;
     status: DeploymentRolloutStatus;
     message: string;
+    /** Código principal de esa instancia (K8S-1xx). */
+    code: string;
+    errorKey: RolloutErrorKey;
+    /** Causas secundarias de esa instancia (K8S-2xx). */
+    causes: RolloutCause[];
 }
 
 export interface DeploymentGroupWatchResult {
@@ -707,10 +932,15 @@ export class DeploymentGroupRolloutError extends Error {
     readonly elapsedMs: number;
     readonly succeeded: string[];
     readonly failed: DeploymentGroupFailure[];
+    /** K8S-109-GROUPEMPTY (grupo vacío) o K8S-110-GROUPFAIL (alguna instancia falló). */
+    readonly code: string;
+    readonly errorKey: RolloutErrorKey;
 
-    constructor(message: string, info: { label: string; elapsedMs: number; succeeded: string[]; failed: DeploymentGroupFailure[] }) {
+    constructor(message: string, info: { label: string; elapsedMs: number; succeeded: string[]; failed: DeploymentGroupFailure[]; errorKey?: RolloutErrorKey }) {
         super(message);
         this.name = "DeploymentGroupRolloutError";
+        this.errorKey = info.errorKey ?? (info.failed.length ? "GROUP_FAILED" : "GROUP_EMPTY");
+        this.code = ROLLOUT_ERRORS[this.errorKey].code;
         this.label = info.label;
         this.elapsedMs = info.elapsedMs;
         this.succeeded = info.succeeded;
@@ -738,6 +968,8 @@ export interface WaitForDeploymentGroupOptions extends KubectlOptions {
     printEvents?: boolean | PrintEventsOptions;
     /** Igual que en waitForDeployment: se imprime al final, por cada instancia que falle. */
     printLogs?: boolean | PrintLogsOptions;
+    /** Igual que en waitForDeployment: estado periódico de cada instancia y sus pods. Default: 15000. */
+    statusInterval?: number;
 }
 
 function toSelectorString(label: string | Record<string, string>): string {
@@ -787,21 +1019,33 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
         maxRestarts,
         printEvents,
         printLogs,
+        statusInterval,
         ...kubectlOptions
     } = options;
 
     const selector = toSelectorString(label);
     const startedAt = Date.now();
 
-    const names = await listDeploymentNames(selector, kubectlOptions);
+    let names: string[];
+
+    try {
+        names = await listDeploymentNames(selector, kubectlOptions);
+    } catch (error) {
+        const text = errorText(error);
+        const errorKey: RolloutErrorKey = classifyReadError(text) === "access" ? "ACCESS_DENIED" : "CLUSTER_UNREACHABLE";
+        const message = `[${ROLLOUT_ERRORS[errorKey].code}] No se pudo listar el grupo "${selector}": ${text}`;
+        logger.error(message);
+        throw new DeploymentGroupRolloutError(message, { label: selector, elapsedMs: Date.now() - startedAt, succeeded: [], failed: [], errorKey });
+    }
 
     if (!names.length) {
-        const message = `No se encontraron deployments con el label "${selector}"`;
+        const message = `[${ROLLOUT_ERRORS.GROUP_EMPTY.code}] No se encontraron deployments con el label "${selector}"`;
         throw new DeploymentGroupRolloutError(message, {
             label: selector,
             elapsedMs: Date.now() - startedAt,
             succeeded: [],
-            failed: []
+            failed: [],
+            errorKey: "GROUP_EMPTY"
         });
     }
 
@@ -814,6 +1058,7 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
             pollInterval,
             failedGracePeriod,
             maxRestarts,
+            statusInterval,
             ...kubectlOptions
         }))
     );
@@ -833,11 +1078,15 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
         }
 
         const reason = outcome.reason as Partial<DeploymentRolloutError>;
+        const errorKey: RolloutErrorKey = reason?.errorKey ?? "ROLLOUT_FAILED";
 
         failed.push({
             deployment: name,
             status: reason?.status ?? "failed",
-            message: reason?.message ?? String(outcome.reason)
+            message: reason?.message ?? String(outcome.reason),
+            code: ROLLOUT_ERRORS[errorKey].code,
+            errorKey,
+            causes: reason?.causes ?? []
         });
 
     });
@@ -851,10 +1100,10 @@ export async function waitForDeploymentGroup(options: WaitForDeploymentGroupOpti
             await printDiagnostics(failure.deployment, { printEvents, printLogs }, kubectlOptions);
         }
 
-        const summary = failed.map(f => `${f.deployment} (${f.status})`).join(", ");
-        const message = `${failed.length}/${names.length} deployments del grupo "${selector}" no llegaron a estado exitoso: ${summary}`;
+        const summary = failed.map(f => `${f.deployment} (${f.code}${f.causes.length ? `: ${f.causes.map(c => c.code).join("/")}` : ""})`).join(", ");
+        const message = `[${ROLLOUT_ERRORS.GROUP_FAILED.code}] ${failed.length}/${names.length} deployments del grupo "${selector}" no llegaron a estado exitoso: ${summary}`;
 
-        throw new DeploymentGroupRolloutError(message, { label: selector, elapsedMs, succeeded, failed });
+        throw new DeploymentGroupRolloutError(message, { label: selector, elapsedMs, succeeded, failed, errorKey: "GROUP_FAILED" });
 
     }
 

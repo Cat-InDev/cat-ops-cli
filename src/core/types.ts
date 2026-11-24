@@ -136,6 +136,49 @@ export interface NotificationEvent {
     method?: string;
     /** Argumentos pasados al método. */
     args?: unknown[];
+    /**
+     * Código del error (solo en eventos de error), siempre presente:
+     * el mapeado con `notifier.code(...)`, el propio del error (p. ej.
+     * "K8S-102-MAXREINIT") o un genérico ("GEN-000-UNKNOWN", "GEN-001-EXEC").
+     */
+    code?: string;
+    /** Causas secundarias con código que trae el error (p. ej. K8S-201-OOMKILLED). */
+    causes?: Array<{ code: string; detail?: string; pod?: string; container?: string; [key: string]: unknown }>;
+    /** Mensaje crudo del error, antes de `mapCode`/`describeError` (para verificar el mapeo). */
+    rawMessage?: string;
+    /** Código (principal o de una causa) con el que matcheó un `mapCode`, si alguno aplicó. */
+    mappedCode?: string;
+}
+
+/**
+ * Asigna un código propio a un error (formato DOMINIO-NNN-NOMBRE). Devuelve
+ * `undefined` si no sabe codificarlo (se prueba el siguiente; al final se usa
+ * el código propio del error o un genérico GEN-xxx).
+ */
+export type ErrorCodeResolver = (error: unknown, ctx: Context) => string | undefined;
+
+/** Datos que recibe un `message` dinámico de `notifier.mapCode(...)`. */
+export interface ErrorCodeInfo {
+    taskId: string;
+    /** Código principal del error. */
+    code: string;
+    /** Código con el que matcheó el mapeo (el principal o el de una causa). */
+    matchedCode: string;
+    causes: NonNullable<NotificationEvent["causes"]>;
+    error: unknown;
+    /** Mensaje crudo del error. */
+    rawMessage: string;
+}
+
+/** Qué cambiar cuando un error tiene cierto código. */
+export interface ErrorCodeOverride {
+    /**
+     * Mensaje a reportar en los canales. String fijo (admite `{code}`,
+     * `{matchedCode}`, `{taskId}` y `{rawMessage}`) o función.
+     */
+    message?: string | ((info: ErrorCodeInfo, ctx: Context) => string);
+    /** Área (canal) a la que se enruta, en vez de la de los classifiers. */
+    area?: string;
 }
 
 /**

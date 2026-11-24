@@ -655,9 +655,11 @@ await ctx.services.oc.apply("deploy.yaml", { namespace: "prod" });
 Sondea el Deployment (o `DeploymentConfig` con `oc` + `resourceType: "dc"`) hasta que:
 
 - llega a **estado exitoso** (réplicas listas/actualizadas == deseadas) → resuelve con `{ status: "success", ... }`,
-- se queda en **estado Failed** más de `failedGracePeriod` sin recuperarse → lanza `DeploymentRolloutError`,
-- supera **`maxRestarts`** reinicios acumulados entre todos sus pods → lanza `DeploymentRolloutError` de inmediato, sin esperar el grace period,
-- o se cumple el **`timeout`** global sin éxito → lanza `DeploymentRolloutError`.
+- se queda en **estado Failed** más de `failedGracePeriod` sin recuperarse → lanza `DeploymentRolloutError` (`K8S-103-DEADLINE`, `K8S-104-REPLICAFAIL` o `K8S-105-FAILED` según la condición),
+- supera **`maxRestarts`** reinicios acumulados entre todos sus pods → lanza `DeploymentRolloutError` (`K8S-102-MAXREINIT`) de inmediato, sin esperar el grace period,
+- o se cumple el **`timeout`** global sin éxito → lanza `DeploymentRolloutError` (`K8S-101-TIMEOUT`; o `K8S-106-NOTFOUND`/`K8S-108-UNREACHABLE` si el recurso nunca se pudo leer).
+
+Cada error trae su código principal y las causas detectadas (OOMKilled, ImagePull, probes, quota, scheduling...): ver el [catálogo de errores de rollout](#catálogo-de-errores-de-rollout-k8s-nnn-nombre).
 
 En los tres casos de fallo, el polling se detiene y el error se re-lanza — listo para que `ctx.run(...)` lo capture y lo reporte automáticamente vía `ctx.notifier` (el error ya trae `command: "kubectl"` / `command: "oc"`, así que `classifiers.byCommand({ kubectl: "kubernetes" })` lo clasifica sin configuración extra).
 
@@ -676,7 +678,15 @@ await ctx.run("deploy-api", async () => {
 });
 ```
 
-El polling es silencioso: no imprime el comando ni el JSON en cada iteración. Si la validación termina con error (timeout, Failed o `maxRestarts`), se imprime **una sola vez, al final**, un diagnóstico con las condiciones del recurso (p. ej. `ReplicaFailure (FailedCreate): ... exceeded quota`) y, según los flags:
+El polling no imprime el comando ni el JSON en cada iteración. Para que no parezca pegado, cada `statusInterval` ms (default `15000`, `0` lo desactiva) imprime un resumen del recurso y **una línea por pod**:
+
+```
+INFO [deployment/api] esperando rollout | 1m15s/5m0s | listas=1/2 | actualizadas=2/2 | Progressing=True (ReplicaSetUpdated)
+INFO [deployment/api] pod api-7d9f-abc | status=Running | ready=1/1 | restarts=0 | age=1m35s | node=worker-1
+WARN [deployment/api] pod api-7d9f-xyz | status=CrashLoopBackOff | ready=0/1 | restarts=2 (último: Error) | age=40s | node=worker-2
+```
+
+En `waitForDeploymentGroup` cada instancia imprime sus propias líneas con su prefijo. Si la validación termina con error (timeout, Failed o `maxRestarts`), se imprime **una sola vez, al final**, un diagnóstico con las condiciones del recurso (p. ej. `ReplicaFailure (FailedCreate): ... exceeded quota`) y, según los flags:
 
 - `printEvents`: `true` imprime los eventos del deployment y de sus pods; también se puede elegir con `{ deployment: true, pods: true }`. Los eventos del deployment **incluyen los de sus ReplicaSets** (o ReplicationControllers y deployer pods con `dc`), que es donde Kubernetes registra los `FailedCreate` por quota: esos pods nunca llegan a existir.
 - `printLogs`: `true` imprime el log actual y el anterior (`--previous`, vacío si no existe) de cada pod, con todos sus contenedores; también se puede elegir con `{ current, previous, tail }`.
@@ -748,6 +758,86 @@ await ctx.run("deploy-repo-14", () =>
 - Si el label **no matchea ningún deployment**, también lanza `DeploymentGroupRolloutError` (grupo vacío = error, no éxito silencioso).
 
 Con `oc`, ambas funciones aceptan `resourceType: "dc"` para apuntar a `DeploymentConfig` clásico en vez de `Deployment` nativo (default: `"deployment"`).
+
+### Catálogo de errores de rollout (`K8S-NNN-NOMBRE`)
+
+Cuando `waitForDeployment` / `waitForDeploymentGroup` (de `kubectl` y de `oc`) terminan con error, el error trae un **código principal** (por qué terminó la validación) y una lista de **causas secundarias** (por qué no se levantó), detectadas en una sola consulta final de pods + eventos + condiciones:
+
+Los códigos tienen el formato `K8S-<número>-<NOMBRE>`: el número es estable (agrupa y ordena) y el sufijo describe el error de un vistazo (p. ej. `K8S-201-OOMKILLED`, `K8S-102-MAXREINIT`). Son los mismos códigos que llegan a los canales del notifier, así que se pueden interceptar con `ctx.notifier.mapCode("K8S-201-OOMKILLED", {...})` (ver [Códigos de error en todas las tareas](#códigos-de-error-en-todas-las-tareas)).
+
+- `K8S-1xx` — **principales**: `err.code` / `err.errorKey`.
+- `K8S-2xx` — **secundarias**: `err.causes[]`, cada una con `{ code, key, title, hint, detail, pod?, container? }`. Se deduplican por código + pod.
+
+```javascript
+try {
+    await ctx.services.kubectl.waitForDeployment({ deployment: "api", namespace: "prod", maxRestarts: 5 });
+} catch (err) {
+    err.code;       // "K8S-102-MAXREINIT"
+    err.errorKey;   // "MAX_RESTARTS_EXCEEDED" (clave estable para usar en código)
+    err.causes;     // [{ code: "K8S-201-OOMKILLED", key: "OOM_KILLED", pod: "api-7d9f-x", container: "app", detail: "límite de memoria 256Mi, restarts=6", ... }, ...]
+    err.message;    // "[K8S-102-MAXREINIT] Deployment \"api\" superó el máximo de reinicios permitido (6 > 5) | causas: K8S-201-OOMKILLED en api-7d9f-x, K8S-202-CRASHLOOP en api-7d9f-x"
+}
+```
+
+Además, al fallar se imprime siempre (con o sin `printEvents`/`printLogs`) el error principal y **una línea por causa**:
+
+```
+ERROR [K8S-102-MAXREINIT] deployment/api: Deployment "api" superó el máximo de reinicios permitido (6 > 5)
+WARN  [deployment/api] K8S-201-OOMKILLED | pod api-7d9f-x | container app | límite de memoria 256Mi, restarts=6 | sugerencia: Subir `resources.limits.memory` ...
+WARN  [deployment/api] K8S-202-CRASHLOOP | pod api-7d9f-x | container app | CrashLoopBackOff: back-off 5m0s ... | sugerencia: Revisar el log anterior (--previous) ...
+```
+
+En `waitForDeploymentGroup`, `err.code` es `K8S-109-GROUPEMPTY`/`K8S-110-GROUPFAIL` y cada elemento de `err.failed[]` trae su propio `code`, `errorKey` y `causes`. El catálogo completo está disponible en código con `ROLLOUT_ERRORS` (por clave) y `rolloutErrorCatalog()` (lista ordenada), exportados desde la raíz del paquete y desde `services.kubectl` / `services.oc`; `diagnoseRollout(...)` expone el clasificador por si quieres aplicarlo a tus propios JSON de pods/eventos.
+
+Notas:
+
+- Los eventos del Deployment/ReplicaSets/ReplicationControllers se consideran solo si son de los 10 minutos previos al inicio de la espera en adelante, para no culpar al rollout actual por eventos de un rollout anterior. Los eventos de pods se toman de los pods actuales del selector.
+- `K8S-107-FORBIDDEN` (sin permisos) aborta al primer intento: un `Forbidden`/`Unauthorized` no se arregla reintentando. `K8S-106-NOTFOUND` y `K8S-108-UNREACHABLE` reemplazan al timeout genérico cuando el recurso **nunca** se pudo leer.
+- Si no se detecta nada concreto, la causa es `K8S-299-UNKNOWN UNKNOWN_CAUSE`: usar `printEvents: true` y `printLogs: true` para ver el detalle completo.
+
+#### Errores principales (`K8S-1xx`) — por qué terminó la validación
+
+| Código | Clave | Qué significa | Cómo se detecta | Qué revisar |
+|---|---|---|---|---|
+| `K8S-101-TIMEOUT` | `ROLLOUT_TIMEOUT` | El rollout no terminó dentro del timeout | Se cumple `timeout` sin llegar a listas/actualizadas == deseadas. | Revisar las causas secundarias; si el despliegue es lento por naturaleza, aumentar `timeout`. |
+| `K8S-102-MAXREINIT` | `MAX_RESTARTS_EXCEEDED` | Los pods superaron el máximo de reinicios permitido | Suma de `restartCount` de los pods > `maxRestarts` (aborta de inmediato). | La app se cae al arrancar: revisar logs (`printLogs`) y las causas (OOMKilled, exit code, liveness). |
+| `K8S-103-DEADLINE` | `PROGRESS_DEADLINE_EXCEEDED` | Kubernetes marcó el rollout como estancado (progressDeadlineSeconds) | `Progressing=False` con reason `ProgressDeadlineExceeded` durante más de `failedGracePeriod`. | Los pods nuevos no llegan a Ready: revisar causas secundarias y `spec.progressDeadlineSeconds`. |
+| `K8S-104-REPLICAFAIL` | `REPLICA_FAILURE` | El controlador no pudo crear los pods (ReplicaFailure) | Condición `ReplicaFailure=True` (FailedCreate) durante más de `failedGracePeriod`. | Normalmente quota, LimitRange, SCC/PodSecurity o un webhook de admisión: ver causas secundarias. |
+| `K8S-105-FAILED` | `ROLLOUT_FAILED` | El recurso quedó en estado Failed (Progressing=False) y no se recuperó | `Progressing=False` con otro reason (p. ej. rollout de un dc cancelado) durante más de `failedGracePeriod`. | Revisar la condición informada y los eventos del recurso. |
+| `K8S-106-NOTFOUND` | `RESOURCE_NOT_FOUND` | El Deployment/DeploymentConfig no existe en el namespace | Durante todo el `timeout` el `get` devolvió `NotFound`. | Verificar nombre, namespace, kubeconfig y que el apply/sync se haya hecho. |
+| `K8S-107-FORBIDDEN` | `ACCESS_DENIED` | Sin permisos o credenciales inválidas para leer el recurso | El `get` devuelve `Unauthorized`/`Forbidden` (aborta de inmediato, no reintenta). | Revisar token/kubeconfig (Unauthorized) o el RBAC del service account (Forbidden). |
+| `K8S-108-UNREACHABLE` | `CLUSTER_UNREACHABLE` | No se pudo consultar el cluster durante toda la validación | Durante todo el `timeout` el `get` falló por otro motivo (conexión, TLS, CLI). | Revisar conectividad con el API server, VPN/proxy, certificados y que el CLI esté instalado. |
+| `K8S-109-GROUPEMPTY` | `GROUP_EMPTY` | Ningún recurso coincide con el label del grupo | `waitForDeploymentGroup`: el label no devuelve recursos. | Verificar el label (p. ej. `deployment-group=repository-14`), el namespace y el `resourceType`. |
+| `K8S-110-GROUPFAIL` | `GROUP_FAILED` | Una o más instancias del grupo no llegaron a estado exitoso | `waitForDeploymentGroup`: al menos una instancia falló. | Ver `failed[]`: cada instancia trae su propio código principal y sus causas. |
+
+#### Errores secundarios (`K8S-2xx`) — por qué no se levantó
+
+| Código | Clave | Qué significa | Cómo se detecta | Qué revisar |
+|---|---|---|---|---|
+| `K8S-201-OOMKILLED` | `OOM_KILLED` | Contenedor terminado por falta de memoria (OOMKilled) | `state`/`lastState.terminated.reason = OOMKilled` (informa el límite de memoria). | Subir `resources.limits.memory` o reducir el consumo (heap de JVM/Node, cachés). |
+| `K8S-202-CRASHLOOP` | `CRASH_LOOP_BACKOFF` | El contenedor se cae repetidamente (CrashLoopBackOff) | `waiting.reason = CrashLoopBackOff` o evento `BackOff` "restarting failed container". | Revisar el log anterior (--previous): error de arranque, config o dependencia caída. |
+| `K8S-203-EXITCODE` | `CONTAINER_EXIT_ERROR` | El contenedor terminó con código de salida distinto de 0 | `terminated.exitCode != 0` (informa reason y exit code). | Revisar logs; exit 1 = error de la app, 126/127 = comando no ejecutable/no encontrado, 137 = SIGKILL, 143 = SIGTERM. |
+| `K8S-204-IMAGEPULL` | `IMAGE_PULL_FAILED` | No se pudo descargar la imagen (ErrImagePull / ImagePullBackOff) | `waiting.reason` `ErrImagePull`/`ImagePullBackOff`/`ErrImageNeverPull`, o eventos `Failed`/`BackOff` de pull. | Verificar que el tag exista, el acceso al registry y el `imagePullSecrets`. |
+| `K8S-205-IMAGENAME` | `INVALID_IMAGE_NAME` | El nombre de la imagen es inválido | `waiting.reason = InvalidImageName` o evento `InspectFailed`. | Revisar la referencia de imagen en el manifiesto (registry/repo:tag). |
+| `K8S-206-CONFIGMISSING` | `CONFIG_ERROR` | Falta configuración para crear el contenedor (CreateContainerConfigError) | `waiting.reason = CreateContainerConfigError` (Secret/ConfigMap/key faltante). | Un Secret/ConfigMap (o una key) referenciado no existe en el namespace. |
+| `K8S-207-CREATEFAIL` | `CONTAINER_CREATE_FAILED` | El runtime no pudo crear/arrancar el contenedor | `CreateContainerError`, `RunContainerError`, `ContainerCannotRun`, `StartError`, hooks fallidos. | Revisar command/args, entrypoint, permisos del filesystem y securityContext. |
+| `K8S-208-INITFAIL` | `INIT_CONTAINER_FAILED` | Un init container falló o no termina | Un init container en waiting (≠ PodInitializing) o terminado con exit ≠ 0. | Revisar el log del init container (migraciones, espera de dependencias, permisos). |
+| `K8S-209-READINESS` | `READINESS_PROBE_FAILED` | Falla el readiness probe (el pod no recibe tráfico) | Evento `Unhealthy` "Readiness probe failed". | Verificar path/puerto del health, tiempos (`initialDelaySeconds`, `timeoutSeconds`) y dependencias. |
+| `K8S-210-LIVENESS` | `LIVENESS_PROBE_FAILED` | Falla el liveness probe (Kubernetes reinicia el contenedor) | Evento `Unhealthy` "Liveness probe failed". | Verificar el endpoint de health y darle más margen (`initialDelaySeconds`/`failureThreshold`) o usar startupProbe. |
+| `K8S-211-STARTUP` | `STARTUP_PROBE_FAILED` | Falla el startup probe (la app no termina de arrancar) | Evento `Unhealthy` "Startup probe failed". | Aumentar `failureThreshold * periodSeconds` o revisar por qué el arranque es lento. |
+| `K8S-212-NORESOURCES` | `INSUFFICIENT_RESOURCES` | No hay nodos con CPU/memoria suficiente para programar el pod | `FailedScheduling` / `PodScheduled=False` con "Insufficient cpu/memory" o "Too many pods". | Bajar `resources.requests`, escalar el cluster o liberar capacidad. |
+| `K8S-213-UNSCHEDULABLE` | `UNSCHEDULABLE` | El pod no se puede programar en ningún nodo | `FailedScheduling` por taints, nodeSelector, afinidad, etc. | Revisar nodeSelector, afinidad/antiafinidad, taints/tolerations y topology spread. |
+| `K8S-214-PVCUNBOUND` | `PVC_UNBOUND` | Un PersistentVolumeClaim no existe o no está enlazado | `FailedScheduling` con "unbound PersistentVolumeClaims" o PVC no encontrado. | Verificar el PVC, su StorageClass y que haya PVs/provisioner disponibles. |
+| `K8S-215-MOUNTFAIL` | `VOLUME_MOUNT_FAILED` | No se pudo montar/adjuntar un volumen | Eventos `FailedMount`, `FailedAttachVolume`, `FailedMapVolume`. | Revisar que el Secret/ConfigMap/PVC exista y que el volumen no esté tomado por otro nodo. |
+| `K8S-216-QUOTA` | `QUOTA_EXCEEDED` | Se excedió el ResourceQuota del namespace | `FailedCreate` / `ReplicaFailure` con "exceeded quota". | Pedir más quota, bajar requests/limits o réplicas, o liberar recursos del namespace. |
+| `K8S-217-ADMISSION` | `ADMISSION_DENIED` | La creación del pod fue rechazada (LimitRange, SCC, PodSecurity o webhook) | `FailedCreate` / `ReplicaFailure` por otro rechazo (LimitRange, SCC, PodSecurity, webhook). | Ajustar el pod a las políticas del namespace (límites, securityContext, SCC) según el mensaje. |
+| `K8S-218-EVICTED` | `POD_EVICTED` | El pod fue desalojado del nodo (Evicted) | `status.reason = Evicted` o evento `Evicted`. | Normalmente presión de memoria/disco en el nodo: revisar requests y uso de ephemeral-storage. |
+| `K8S-219-NOPODS` | `PODS_NOT_CREATED` | No existe ningún pod del deployment | El selector no devuelve pods y no hay quota/admisión que lo explique. | Revisar eventos del ReplicaSet/ReplicationController y que `replicas` no sea 0. |
+| `K8S-220-NOTREADY` | `PODS_NOT_READY` | Pods corriendo pero no Ready, sin una causa explícita | Pod `Running` y no Ready, sin otra causa detectada para ese pod. | Revisar readiness probe, logs de la app y dependencias externas. |
+| `K8S-221-PENDING` | `PODS_PENDING` | Pods en Pending sin una causa explícita | Pod `Pending` sin otra causa detectada para ese pod. | Revisar eventos del pod (scheduling, volúmenes, pull de imagen). |
+| `K8S-222-DEPLOYERFAIL` | `DEPLOYER_FAILED` | Falló o se canceló el deployer pod del DeploymentConfig (OpenShift) | `dc`: evento Warning del deployer pod `<dc>-<n>-deploy` o `DeploymentCancelled`/`RolloutCancelled`/`DeploymentFailed`. | Revisar el log del pod `<dc>-<n>-deploy` y los eventos del ReplicationController. |
+| `K8S-223-NODELOST` | `NODE_LOST` | El nodo del pod dejó de responder (estado Unknown / NodeNotReady) | Pod en fase `Unknown` o evento `NodeNotReady`. | Problema de infraestructura del nodo: revisar el estado del nodo con el equipo de plataforma. |
+| `K8S-299-UNKNOWN` | `UNKNOWN_CAUSE` | No se identificó una causa específica | Ninguna de las anteriores. | Revisar el diagnóstico completo con `printEvents: true` y `printLogs: true`. |
 
 ## Logging commands de Azure Pipelines (`ctx.services.azdo`)
 
@@ -1572,6 +1662,8 @@ ctx.services.http.addRequestInterceptor(async (ctx) => {
 2. **`describeError()`** — decide el **mensaje** a reportar (reemplaza el stderr/stdout crudo por algo humano).
 3. **`channel()`** / **`onSuccess()`** — a qué **senders** se manda cada área.
 
+Además, cada error lleva un **código** (`code()` para asignarlos y `mapCode()` para interceptarlos por código), ver [Códigos de error en todas las tareas](#códigos-de-error-en-todas-las-tareas).
+
 ```javascript
 const { classifiers, messages, senders } = require("catops-cli");
 
@@ -1654,15 +1746,104 @@ Si ningún classifier/formatter matchea, se usa el área `"unclassified"` y el m
 
 | Sender | Uso |
 |---|---|
-| `senders.log()` | Usa el logger interno (consola) |
+| `senders.log()` | Usa el logger interno (consola), con área y código |
+| `senders.console({ causes?, original?, success?, hintGeneric?, only? })` | Consola para **verificar códigos de error**: código, mapeo aplicado, mensaje original y causas (ver [Canal de consola](#canal-de-consola-sendersconsole)) |
 | `senders.file({ path })` | Agrega el evento como una línea JSON al archivo |
 | `senders.http({ url, method?, headers?, formatBody? })` | `POST` genérico del evento como JSON |
 | `senders.webhook({ url, format? })` | Como `http`, pero formatea `{ text: "❌ ..." }` por defecto — compatible con Slack/Discord y con **Microsoft Teams** vía Workflows (Power Automate), pasando un `format` que arme el payload de Adaptive Card que Teams espera |
 | `senders.websocket({ url, timeout? })` | Abre una conexión WS, manda el evento como JSON y cierra. Requiere Node ≥21 (usa el `WebSocket` global) |
 
-Podés escribir tu propio sender: es cualquier función `(event) => void | Promise<void>` — recibe `{ type, taskId, area?, error?, result?, message, timestamp, service?, method?, args? }`.
+Podés escribir tu propio sender: es cualquier función `(event) => void | Promise<void>` — recibe `{ type, taskId, area?, error?, result?, message, timestamp, service?, method?, args?, code?, causes?, rawMessage?, mappedCode? }`.
+
+En los eventos de error, `code` siempre está presente (ver [Códigos de error en todas las tareas](#códigos-de-error-en-todas-las-tareas)). `rawMessage` es el mensaje antes de `mapCode`/`describeError`, `causes` trae las causas secundarias con código (p. ej. las `K8S-2xx` de un rollout) y `mappedCode` indica con qué código matcheó un `mapCode`.
 
 Los campos `service`, `method` y `args` solo están presentes cuando el error viene de `ctx.wrap()` (un `ServiceError`).
+
+### Códigos de error en todas las tareas
+
+Todo evento de error que llega a los canales (`ctx.run`, items de menú, `ctx.wrap`) trae un **código** con el formato `DOMINIO-NNN-NOMBRE`, también en `ctx.failures[].code` y en el `errorCode` del resultado de un pipeline. El número es estable y el sufijo describe el error de un vistazo (`K8S-201-OOMKILLED`, `APP-100-CONFIG`, ...).
+
+El código se resuelve en este orden:
+
+1. **Tus resolvers**, registrados con `ctx.notifier.code(...)`, en orden: gana el primero que devuelva un código válido.
+2. **El código propio del error**: `err.code` / `err.errorCode` con ese formato, como los `DeploymentRolloutError` de `kubectl`/`oc` ([catálogo K8S](#catálogo-de-errores-de-rollout-k8s-nnn-nombre)) o un `CodedError` lanzado por tu task. Se busca también dentro de `ServiceError.cause`. Los `code` de Node (`ENOENT`, ...) no cumplen el formato y se ignoran.
+3. **Un genérico**, según la forma del error:
+
+| Código | Cuándo | Qué hacer |
+|---|---|---|
+| `GEN-000-UNKNOWN` | Cualquier error sin código propio (`Error`, string, ...) | Asignarle uno con `ctx.notifier.code(...)` o lanzar un `CodedError` |
+| `GEN-001-EXEC` | Un comando de `shell.exec` (o de cualquier servicio que lo use) salió con código ≠ 0 | Mapearlo con `codes.byCommand` / `codes.byRule` |
+| `GEN-002-EXECTIMEOUT` | Un comando superó su `exec.timeout` | Aumentar el timeout o revisar por qué se cuelga |
+
+La idea es partir con todo en genérico, mirar en consola qué cae ahí y **ir mapeando** de a poco:
+
+```javascript
+const { codes, senders, CodedError } = require("@cat-indev/catops-cli");
+
+// 1. Canal de consola para verificar los códigos (ver abajo)
+ctx.notifier.channel("*", senders.console());
+
+// 2. Asignar códigos propios a lo que hoy sale como GEN-xxx
+ctx.notifier
+    .code(codes.byRule([
+        { command: "docker", args: "push", pattern: /500 Internal Server Error/, code: "DOCKER-101-PUSH500" },
+        { command: "docker", args: "build", code: "DOCKER-102-BUILD" },
+        { command: "git", pattern: /CONFLICT/, code: "GIT-100-CONFLICT" }
+    ]))
+    .code(codes.byPattern([[/no space left|ENOSPC/i, "INFRA-100-NOSPACE"]]))
+    .code(codes.byCommand({ terraform: "TF-000-EXEC" }));   // catch-all por comando
+
+// 3. Interceptar por código: cambiar el mensaje y/o el canal
+ctx.notifier
+    .mapCode("DOCKER-101-PUSH500", { message: "Se reportó a infraestructura: registry sin espacio", area: "infra" })
+    .mapCode("K8S-201-OOMKILLED", { message: info => `Sin memoria en ${info.causes[0]?.pod}, subir limits` })
+    .mapCode("K8S-1*", { area: "kubernetes" })                        // glob
+    .mapCode(/^GEN-/, { message: "[{code}] {taskId}: {rawMessage}" });  // plantilla
+
+// 4. O que la task lance su propio código
+await ctx.run("config", () => {
+    if (!process.env.DB_URL) throw new CodedError("APP-100-CONFIG", "Falta la variable DB_URL");
+});
+```
+
+**`mapCode(matcher, { message?, area? })`**
+
+- `matcher` puede ser un código exacto, un glob (`"K8S-2*"`), un `RegExp` o una lista de ellos.
+- Primero se busca un mapeo para el **código principal**. Si no hay, se prueba con cada **causa secundaria** en orden. Así, mapear `K8S-201-OOMKILLED` también aplica a un `K8S-101-TIMEOUT` cuyo motivo fue un OOM. `message` y `area` se resuelven por separado: cada uno toma el primer mapeo que matchee **y** defina ese campo (en el ejemplo, el área sale de `K8S-1*` y el mensaje de `K8S-201-OOMKILLED`).
+- `message` puede ser un string con los placeholders `{code}`, `{matchedCode}`, `{taskId}` y `{rawMessage}`, o una función `(info, ctx) => string`. `info` trae `{ taskId, code, matchedCode, causes, error, rawMessage }`.
+- `area` cambia el canal al que se enruta.
+- `mapCode` tiene prioridad sobre `classify()` y `describeError()`. Si no hay mapeo, esos siguen funcionando igual que siempre.
+
+También hay fábricas por código para los mecanismos existentes: `classifiers.byCode({ "K8S-*": "kubernetes" })` y `messages.byCode({ "GEN-001-EXEC": "Falló un comando" })`. `ctx.notifier.resolveCode(error, ctx)` devuelve el código de cualquier error con la misma resolución.
+
+| Fábrica de `codes` | Uso |
+|---|---|
+| `codes.byRule([{ command?, args?, pattern?, code }, ...])` | Comando + sub-comando + patrón de texto, en modo AND (igual que `messages.byRule`) |
+| `codes.byPattern([[regex, code], ...])` | Según el texto del error (stderr → stdout → message) |
+| `codes.byCommand({ docker: "DOCKER-000-EXEC" })` | Código fijo por comando |
+| `codes.byService({ http: "HTTP-000-ERROR" })` | Código fijo por servicio envuelto con `ctx.wrap()` |
+
+Las fábricas validan el formato al registrarse: un código mal formado lanza un error de inmediato, no cuando ocurre el fallo.
+
+#### Canal de consola: `senders.console()`
+
+Pensado para **verificar los códigos**. Por cada error imprime el código, si lo cambió un `mapCode`, el mensaje original (cuando se reemplazó) y una línea por causa secundaria. Para los genéricos, además, sugiere cómo mapearlos:
+
+```
+ERROR [K8S-101-TIMEOUT] (mapeado por K8S-201-OOMKILLED) [kubernetes] deploy-api: Sin memoria en api-7d9f-x, subir limits
+WARN    [K8S-101-TIMEOUT] original: [K8S-101-TIMEOUT] Timeout esperando el rollout de "api" (300000ms) | causas: K8S-201-OOMKILLED en api-7d9f-x
+WARN    [K8S-101-TIMEOUT] causa K8S-201-OOMKILLED | pod api-7d9f-x | container app | límite de memoria 256Mi, restarts=4
+ERROR [GEN-001-EXEC] [unclassified] build: npm ERR! code ELIFECYCLE
+INFO    [GEN-001-EXEC] código genérico: asígnale uno propio con ctx.notifier.code(codes.byRule([...])) o lanza un CodedError
+```
+
+| Opción | Default | |
+|---|---|---|
+| `causes` | `true` | Una línea por causa secundaria |
+| `original` | `true` | El mensaje crudo, si `mapCode`/`describeError` lo cambió |
+| `success` | `true` | Imprime también los eventos de éxito |
+| `hintGeneric` | `true` | Sugerencia para los `GEN-xxx` |
+| `only` | — | Solo los errores cuyo código matchee (`"K8S-*"`, `RegExp` o lista) |
 
 ## Notificaciones de servicios: `ctx.wrap()`
 

@@ -444,7 +444,7 @@ test("oc.waitForDeployment con printLogs imprime logs (actual y anterior) de cad
         ["oc", "logs", "api-2", "--all-containers=true", "--tail", "100"],
         ["oc", "logs", "api-2", "--all-containers=true", "--tail", "100", "--previous"]
     ]);
-    assert.equal(calls.filter(args => args.includes("events")).length, 0, "sin printEvents no se consultan eventos");
+    assert.equal(calls.filter(args => args.includes("events")).length, 1, "los eventos se consultan una sola vez, para el diagnóstico de causas");
 
 });
 
@@ -460,7 +460,8 @@ test("oc.waitForDeployment sin flags no consulta eventos ni logs", async () => {
 
     try {
         await assert.rejects(oc.waitForDeployment({ deployment: "api", timeout: 30, pollInterval: 10 }));
-        assert.equal(calls.filter(args => args.includes("events") || args.includes("logs")).length, 0);
+        assert.equal(calls.filter(args => args.includes("logs")).length, 0, "sin printLogs no se piden logs");
+        assert.equal(calls.filter(args => args.includes("events")).length, 1, "eventos: una sola consulta, para el diagnóstico");
     } finally {
         shell.exec = original;
     }

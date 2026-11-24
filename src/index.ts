@@ -77,10 +77,17 @@ export type { WorkspaceFile } from "./services/azdo-workspace";
 export { AzdoApiError, parseAzdoError, formatAzdoError } from "./services/azdo-errors";
 export type { AzdoErrorDetail, AzdoErrorBody } from "./services/azdo-errors";
 
+export { ROLLOUT_ERRORS, rolloutErrorCatalog, diagnoseRollout } from "./services/k8s-rollout";
+export type { RolloutCause, RolloutErrorDefinition, RolloutErrorKey, RolloutErrorLevel } from "./services/k8s-rollout";
+
 export { Notifier } from "./core/Notifier";
 export * as senders from "./core/senders";
 export * as classifiers from "./core/classifiers";
 export * as messages from "./core/messages";
+export * as codes from "./core/codes";
+export { CodedError, GENERIC_ERRORS, ERROR_CODE_PATTERN, builtInErrorCode, codeMatches, errorCauses } from "./core/errorCodes";
+export type { ErrorCodeMatcher, ErrorCauseLike, GenericErrorDefinition } from "./core/errorCodes";
+export type { CodeRule } from "./core/codes";
 
 export type {
     ExecOptions,
@@ -96,7 +103,11 @@ export type {
     NotificationEvent,
     ErrorClassifier,
     ErrorMessageFormatter,
+    ErrorCodeResolver,
+    ErrorCodeOverride,
+    ErrorCodeInfo,
     Sender
 } from "./core/types";
+export type { ConsoleSenderOptions } from "./core/senders";
 
 export { ServiceError } from "./core/types";

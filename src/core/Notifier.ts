@@ -1,6 +1,16 @@
 import type { Context } from "./Context";
-import type { ErrorClassifier, ErrorMessageFormatter, NotificationEvent, Sender } from "./types";
+import type {
+    ErrorClassifier,
+    ErrorCodeInfo,
+    ErrorCodeOverride,
+    ErrorCodeResolver,
+    ErrorMessageFormatter,
+    NotificationEvent,
+    Sender
+} from "./types";
 import { ServiceError } from "./types";
+import { builtInErrorCode, codeMatches, errorCauses, isErrorCode } from "./errorCodes";
+import type { ErrorCodeMatcher } from "./errorCodes";
 
 const WILDCARD = "*";
 
@@ -27,10 +37,20 @@ function toMessage(error: unknown): string {
 
 }
 
+function renderOverrideMessage(message: NonNullable<ErrorCodeOverride["message"]>, info: ErrorCodeInfo, ctx: Context): string {
+
+    if (typeof message === "function") return message(info, ctx);
+
+    return message.replace(/\{(code|matchedCode|taskId|rawMessage)\}/g, (_, key: keyof ErrorCodeInfo) => String(info[key]));
+
+}
+
 export class Notifier {
 
     private classifiers: ErrorClassifier[] = [];
     private messageFormatters: ErrorMessageFormatter[] = [];
+    private codeResolvers: ErrorCodeResolver[] = [];
+    private codeOverrides: Array<{ matcher: ErrorCodeMatcher; override: ErrorCodeOverride }> = [];
     private channels: Map<string, Sender[]> = new Map();
     private successSenders: Sender[] = [];
     private defaultArea = "unclassified";
@@ -61,6 +81,70 @@ export class Notifier {
     describeError(formatter: ErrorMessageFormatter): this {
         this.messageFormatters.push(formatter);
         return this;
+    }
+
+    /**
+     * Registra un resolver que asigna un código propio (DOMINIO-NNN-NOMBRE)
+     * a un error. Se prueban en orden; gana el primero que devuelva un código
+     * válido. Si ninguno matchea, se usa el código propio del error (p. ej.
+     * "K8S-102-MAXREINIT", o un `CodedError`) o un genérico ("GEN-000-UNKNOWN",
+     * "GEN-001-EXEC", "GEN-002-EXECTIMEOUT").
+     *
+     *   notifier.code(codes.byRule([{ command: "docker", args: "push", code: "DOCKER-100-PUSH" }]));
+     */
+    code(resolver: ErrorCodeResolver): this {
+        this.codeResolvers.push(resolver);
+        return this;
+    }
+
+    /**
+     * Intercepta los errores con cierto código para cambiar el mensaje que
+     * llega a los canales y/o el área a la que se enrutan. `matcher` puede ser
+     * un código exacto, un glob ("K8S-2*"), un RegExp o una lista.
+     *
+     * Primero se busca un mapeo para el código principal; si no hay, para
+     * las causas secundarias del error en orden (p. ej. mapear
+     * "K8S-201-OOMKILLED" aplica a un K8S-101-TIMEOUT causado por OOM).
+     * `message` y `area` se resuelven por separado: cada uno toma el primer
+     * mapeo registrado que matchee Y defina ese campo. Tiene prioridad sobre
+     * `classify` y `describeError`.
+     *
+     *   notifier.mapCode("K8S-201-OOMKILLED", { message: "Sin memoria en {taskId}: subir limits", area: "apps" });
+     */
+    mapCode(matcher: ErrorCodeMatcher, override: ErrorCodeOverride): this {
+        this.codeOverrides.push({ matcher, override });
+        return this;
+    }
+
+    /** Código del error, con la misma resolución que usa `reportError`. */
+    resolveCode(error: unknown, ctx: Context): string {
+
+        for (const resolver of this.codeResolvers) {
+            const code = resolver(error, ctx);
+            if (isErrorCode(code)) return code;
+        }
+
+        return builtInErrorCode(error);
+
+    }
+
+    /**
+     * Primer mapeo que defina `field`, probando el código principal y luego
+     * las causas en orden. Mensaje y área se resuelven por separado: un
+     * `mapCode("K8S-1*", { area })` no tapa el `message` de un mapeo de causa.
+     */
+    private findOverride<K extends keyof ErrorCodeOverride>(
+        codes: string[],
+        field: K
+    ): { value: NonNullable<ErrorCodeOverride[K]>; matchedCode: string } | undefined {
+
+        for (const code of codes) {
+            const found = this.codeOverrides.find(entry => entry.override[field] !== undefined && codeMatches(entry.matcher, code));
+            if (found) return { value: found.override[field] as NonNullable<ErrorCodeOverride[K]>, matchedCode: code };
+        }
+
+        return undefined;
+
     }
 
     setDefaultArea(area: string): this {
@@ -133,7 +217,15 @@ export class Notifier {
 
     async reportError(taskId: string, error: unknown, ctx: Context): Promise<string> {
 
-        const area = this.resolveArea(error, ctx);
+        const code = this.resolveCode(error, ctx);
+        const causes = errorCauses(error);
+        const rawMessage = toMessage(error);
+        const candidates = [code, ...causes.map(cause => cause.code)];
+        const messageMapping = this.findOverride(candidates, "message");
+        const areaMapping = this.findOverride(candidates, "area");
+
+        const area = areaMapping?.value ?? this.resolveArea(error, ctx);
+        const mappedCode = messageMapping?.matchedCode ?? areaMapping?.matchedCode;
 
         const senders = [
             ...(this.channels.get(area) ?? []),
@@ -147,8 +239,14 @@ export class Notifier {
             taskId,
             area,
             error,
-            message: this.resolveMessage(error, ctx),
+            message: messageMapping
+                ? renderOverrideMessage(messageMapping.value, { taskId, code, matchedCode: messageMapping.matchedCode, causes, error, rawMessage }, ctx)
+                : this.resolveMessage(error, ctx),
             timestamp: new Date().toISOString(),
+            code,
+            rawMessage,
+            ...(causes.length ? { causes } : {}),
+            ...(mappedCode ? { mappedCode } : {}),
             ...(serviceError ? {
                 service: serviceError.service,
                 method: serviceError.method,

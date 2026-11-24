@@ -17,7 +17,8 @@ export class Context {
     env: NodeJS.ProcessEnv;
     vars: Record<string, unknown> = {};
     results: Record<string, unknown> = {};
-    failures: Array<{ label: string; error: unknown }> = [];
+    /** Tasks fallidas, con el código de error resuelto por el notifier (`GEN-xxx` si no tiene uno propio). */
+    failures: Array<{ label: string; error: unknown; code: string }> = [];
     logger: Logger = logger;
     services: ServicesRegistry = services;
     notifier: Notifier = new Notifier();
@@ -77,7 +78,7 @@ export class Context {
      * el menú haya seguido funcionando.
      */
     markFailure(label: string, error: unknown): this {
-        this.failures.push({ label, error });
+        this.failures.push({ label, error, code: this.notifier.resolveCode(error, this) });
         return this;
     }
 

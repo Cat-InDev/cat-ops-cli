@@ -1,5 +1,6 @@
 import type { ErrorClassifier } from "./types";
 import { ServiceError } from "./types";
+import { builtInErrorCode, codeMatches } from "./errorCodes";
 
 interface ExecLikeError {
     command?: string;
@@ -108,6 +109,29 @@ export function byService(map: Record<string, string>): ErrorClassifier {
 
         return undefined;
 
+    };
+
+}
+
+
+/**
+ * Clasificador de fábrica: área según el código del error (exacto, glob
+ * "K8S-*" o RegExp como clave). Usa la misma resolución de código que el
+ * notifier (`notifier.code(...)` + código propio + genérico).
+ *
+ * Ejemplo:
+ *   notifier.classify(classifiers.byCode({
+ *       "K8S-*": "kubernetes",
+ *       "GEN-002-EXECTIMEOUT": "infra"
+ *   }));
+ */
+export function byCode(map: Record<string, string>): ErrorClassifier {
+
+    const entries = Object.entries(map);
+
+    return (error, ctx) => {
+        const code = ctx?.notifier?.resolveCode ? ctx.notifier.resolveCode(error, ctx) : builtInErrorCode(error);
+        return entries.find(([matcher]) => codeMatches(matcher, code))?.[1];
     };
 
 }
